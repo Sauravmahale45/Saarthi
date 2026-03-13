@@ -1,0 +1,39 @@
+{
+  "project_info": {
+    "project_number": "1348324644",
+    "project_id": "saarthi-c3cf4",
+    "storage_bucket": "saarthi-c3cf4.firebasestorage.app"
+  },
+  "client": [
+    {
+      "client_info": {
+        "mobilesdk_app_id": "1:1348324644:android:2dd8183d4ab7f0104a77b1",
+        "android_client_info": {
+          "package_name": "com.example.myapp"
+        }
+      },
+      "oauth_client": [
+        {
+          "client_id": "1348324644-ntg4ltfo0k1o6hmqag9qp4sd2vcue8q0.apps.googleusercontent.com",
+          "client_type": 3
+        }
+      ],
+      "api_key": [
+        {
+          "current_key": "AIzaSyDiLWhMFf-we2MAKBh4QCB8tTay10VaE2w"
+        }
+      ],
+      "services": {
+        "appinvite_service": {
+          "other_platform_oauth_client": [
+            {
+              "client_id": "1348324644-ntg4ltfo0k1o6hmqag9qp4sd2vcue8q0.apps.googleusercontent.com",
+              "client_type": 3
+            }
+          ]
+        }
+      }
+    }
+  ],
+  "configuration_version": "1"
+}
