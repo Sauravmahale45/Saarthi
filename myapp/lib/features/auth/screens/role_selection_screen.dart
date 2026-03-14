@@ -20,24 +20,54 @@ class _RoleSelectionScreenState extends State<RoleSelectionScreen>
   late Animation<double> _slideUp;
 
   @override
+  @override
   void initState() {
     super.initState();
+
     _ctrl = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 800),
     );
+
     _fade = CurvedAnimation(parent: _ctrl, curve: Curves.easeIn);
+
     _slideUp = Tween<double>(
       begin: 40,
       end: 0,
     ).animate(CurvedAnimation(parent: _ctrl, curve: Curves.easeOut));
+
     _ctrl.forward();
+
+    // 🔥 Check role when page opens
+    _checkExistingRole();
   }
 
   @override
   void dispose() {
     _ctrl.dispose();
     super.dispose();
+  }
+
+  Future<void> _checkExistingRole() async {
+    final uid = FirebaseAuth.instance.currentUser?.uid;
+    if (uid == null) return;
+
+    final doc = await FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .get();
+
+    final role = doc.data()?['role'];
+
+    if (!mounted) return;
+
+    if (role == 'admin') {
+      context.go('/admin_home');
+    } else if (role == 'sender') {
+      context.go('/sender');
+    } else if (role == 'traveler') {
+      context.go('/traveler');
+    }
   }
 
   Future<void> _saveRoleAndProceed() async {

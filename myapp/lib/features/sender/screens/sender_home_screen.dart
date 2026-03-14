@@ -1,7 +1,12 @@
+import 'dart:async';
+
 import 'package:flutter/material.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:go_router/go_router.dart';
+
+/// How long a traveler has to respond before the request auto-expires.
+const _kRequestExpiry = Duration(minutes: 15);
 
 class SenderHomeScreen extends StatefulWidget {
   const SenderHomeScreen({super.key});
@@ -13,24 +18,19 @@ class SenderHomeScreen extends StatefulWidget {
 class _SenderHomeScreenState extends State<SenderHomeScreen> {
   final _user = FirebaseAuth.instance.currentUser;
 
-  // ── Sign Out ───────────────────────────────────────────────────────────────
-  Future<void> _signOut() async {
-    await FirebaseAuth.instance.signOut();
-    if (mounted) context.go('/login');
-  }
-
-  // ── Parcel stream ──────────────────────────────────────────────────────────
-  // ✅ FIX: removed orderBy to avoid composite index requirement.
-  // Sorting is done in-memory below after fetching docs.
   Stream<QuerySnapshot> get _parcelsStream => FirebaseFirestore.instance
       .collection('parcels')
       .where('senderId', isEqualTo: _user?.uid)
       .snapshots();
 
+  Future<void> _signOut() async {
+    await FirebaseAuth.instance.signOut();
+    if (mounted) context.go('/login');
+  }
+
   @override
   void initState() {
     super.initState();
-    // ✅ Debug: print UID to verify it matches Firestore senderId field
     debugPrint('🔑 Current UID: ${_user?.uid}');
   }
 
@@ -38,8 +38,6 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
   Widget build(BuildContext context) {
     return Scaffold(
       backgroundColor: const Color(0xFFFAFAFA),
-
-      // ── AppBar ─────────────────────────────────────────────────────────────
       appBar: AppBar(
         backgroundColor: Colors.white,
         elevation: 0,
@@ -108,8 +106,6 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
           ),
         ],
       ),
-
-      // ── Body ───────────────────────────────────────────────────────────────
       body: RefreshIndicator(
         color: const Color(0xFFFF6B35),
         onRefresh: () async => setState(() {}),
@@ -121,10 +117,8 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
             children: [
               _GreetingCard(user: _user),
               const SizedBox(height: 20),
-
               _StatsRow(uid: _user?.uid ?? ''),
               const SizedBox(height: 24),
-
               const Text(
                 'Quick Actions',
                 style: TextStyle(
@@ -134,10 +128,8 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
                 ),
               ),
               const SizedBox(height: 14),
-
               _QuickActions(onSendTap: () => context.go('/create-parcel')),
               const SizedBox(height: 24),
-
               Row(
                 mainAxisAlignment: MainAxisAlignment.spaceBetween,
                 children: [
@@ -160,11 +152,10 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
               ),
               const SizedBox(height: 8),
 
-              // ── Parcel list ───────────────────────────────────────────────
+              // ── Parcel list ─────────────────────────────────────────────
               StreamBuilder<QuerySnapshot>(
                 stream: _parcelsStream,
                 builder: (context, snapshot) {
-                  // ── Loading ────────────────────────────────────────────────
                   if (snapshot.connectionState == ConnectionState.waiting) {
                     return const Center(
                       child: Padding(
@@ -175,31 +166,26 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
                       ),
                     );
                   }
-
-                  // ── Error (shows index link in debug console) ──────────────
                   if (snapshot.hasError) {
                     debugPrint('🔴 Firestore error: ${snapshot.error}');
                     return _ErrorState(error: snapshot.error.toString());
                   }
-
-                  // ── Empty ──────────────────────────────────────────────────
                   if (!snapshot.hasData || snapshot.data!.docs.isEmpty) {
                     return _EmptyParcels(
                       onTap: () => context.go('/create-parcel'),
                     );
                   }
 
-                  // ── ✅ Sort in-memory by createdAt descending ───────────────
                   final docs = snapshot.data!.docs.toList()
                     ..sort((a, b) {
-                      final aData = a.data() as Map<String, dynamic>;
-                      final bData = b.data() as Map<String, dynamic>;
-                      final aTime = aData['createdAt'] as Timestamp?;
-                      final bTime = bData['createdAt'] as Timestamp?;
+                      final aTime =
+                          (a.data() as Map)['createdAt'] as Timestamp?;
+                      final bTime =
+                          (b.data() as Map)['createdAt'] as Timestamp?;
                       if (aTime == null && bTime == null) return 0;
                       if (aTime == null) return 1;
                       if (bTime == null) return -1;
-                      return bTime.compareTo(aTime); // newest first
+                      return bTime.compareTo(aTime);
                     });
 
                   return Column(
@@ -216,14 +202,11 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
                   );
                 },
               ),
-
               const SizedBox(height: 100),
             ],
           ),
         ),
       ),
-
-      // ── FAB ────────────────────────────────────────────────────────────────
       floatingActionButton: FloatingActionButton.extended(
         onPressed: () => context.go('/create-parcel'),
         backgroundColor: const Color(0xFFFF6B35),
@@ -238,7 +221,6 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
     );
   }
 
-  // ── Profile Bottom Sheet ───────────────────────────────────────────────────
   void _showProfileSheet(BuildContext context) {
     showModalBottomSheet(
       context: context,
@@ -337,7 +319,451 @@ class _SenderHomeScreenState extends State<SenderHomeScreen> {
   }
 }
 
-// ── Greeting Card ──────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  PARCEL CARD
+//  — Shows a live 15-min countdown when status == 'requested'
+//  — Timer starts precisely from requestedAt, not from "now"
+//  — Countdown bar colour shifts teal → orange → red as time runs out
+//  — When expired: shows "Expired" label and grey bar (no Firestore write
+//    here — that is handled by the traveler screen and available_travelers
+//    screen; this card is read-only display)
+// ════════════════════════════════════════════════════════════════════════════
+class _ParcelCard extends StatefulWidget {
+  final Map<String, dynamic> data;
+  final String docId;
+  final VoidCallback onTap;
+
+  const _ParcelCard({
+    required this.data,
+    required this.docId,
+    required this.onTap,
+  });
+
+  @override
+  State<_ParcelCard> createState() => _ParcelCardState();
+}
+
+class _ParcelCardState extends State<_ParcelCard> {
+  Timer? _tickTimer;
+  Duration _remaining = Duration.zero;
+  bool _expired = false;
+
+  bool get _isRequested =>
+      (widget.data['status'] as String? ?? '') == 'requested';
+
+  @override
+  void initState() {
+    super.initState();
+    if (_isRequested) _startTimer();
+  }
+
+  @override
+  void didUpdateWidget(_ParcelCard old) {
+    super.didUpdateWidget(old);
+    // Re-arm if the card transitioned into 'requested' or requestedAt changed
+    final wasRequested = (old.data['status'] as String? ?? '') == 'requested';
+    if (_isRequested && !wasRequested) {
+      _cancelTimer();
+      _expired = false;
+      _startTimer();
+    } else if (!_isRequested) {
+      _cancelTimer();
+    }
+  }
+
+  @override
+  void dispose() {
+    _cancelTimer();
+    super.dispose();
+  }
+
+  void _cancelTimer() {
+    _tickTimer?.cancel();
+    _tickTimer = null;
+  }
+
+  /// Calculates remaining time from requestedAt and starts a 1-second ticker.
+  void _startTimer() {
+    final requestedAt = widget.data['requestedAt'] as Timestamp?;
+
+    if (requestedAt == null) {
+      // No timestamp — treat as just sent; start a fresh 15-min window
+      setState(() {
+        _remaining = _kRequestExpiry;
+        _expired = false;
+      });
+    } else {
+      final elapsed = DateTime.now().difference(requestedAt.toDate());
+
+      if (elapsed >= _kRequestExpiry) {
+        setState(() {
+          _remaining = Duration.zero;
+          _expired = true;
+        });
+        return; // already expired, no need for a ticker
+      }
+
+      setState(() {
+        _remaining = _kRequestExpiry - elapsed;
+        _expired = false;
+      });
+    }
+
+    // Tick every second to keep the display fresh
+    _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+
+      final requestedAt = widget.data['requestedAt'] as Timestamp?;
+      Duration newRemaining;
+
+      if (requestedAt == null) {
+        // Fallback: count down from whatever _remaining was
+        newRemaining = _remaining.inSeconds > 0
+            ? _remaining - const Duration(seconds: 1)
+            : Duration.zero;
+      } else {
+        final elapsed = DateTime.now().difference(requestedAt.toDate());
+        newRemaining = elapsed >= _kRequestExpiry
+            ? Duration.zero
+            : _kRequestExpiry - elapsed;
+      }
+
+      setState(() {
+        _remaining = newRemaining;
+        if (newRemaining == Duration.zero) {
+          _expired = true;
+          _cancelTimer();
+        }
+      });
+    });
+  }
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  String get _countdownLabel {
+    if (_expired) return 'Expired';
+    final m = _remaining.inMinutes;
+    final s = _remaining.inSeconds % 60;
+    if (m > 0) return '$m min ${s.toString().padLeft(2, '0')} sec';
+    return '${s}s left';
+  }
+
+  double get _progress =>
+      (_remaining.inSeconds / _kRequestExpiry.inSeconds).clamp(0.0, 1.0);
+
+  Color get _timerColor {
+    if (_expired) return const Color(0xFF9CA3AF); // grey
+    if (_progress > 0.5) return const Color(0xFF14B8A6); // teal
+    if (_progress > 0.25) return const Color(0xFFF97316); // orange
+    return const Color(0xFFEF4444); // red
+  }
+
+  // ── Status chip colour ────────────────────────────────────────────────────
+  Color get _statusColor {
+    switch (widget.data['status']) {
+      case 'pending':
+        return const Color(0xFFF59E0B);
+      case 'requested':
+        return const Color(0xFFF97316);
+      case 'accepted':
+        return const Color(0xFF3B82F6);
+      case 'picked':
+        return const Color(0xFF6366F1);
+      case 'delivered':
+        return const Color(0xFF22C55E);
+      default:
+        return const Color(0xFF888888);
+    }
+  }
+
+  String get _statusLabel =>
+      (widget.data['status'] as String? ?? 'pending').toUpperCase();
+
+  @override
+  Widget build(BuildContext context) {
+    final d = widget.data;
+
+    return GestureDetector(
+      onTap: widget.onTap,
+      child: Container(
+        margin: const EdgeInsets.only(bottom: 12),
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(
+            color: _isRequested
+                ? _timerColor.withOpacity(0.35)
+                : const Color(0xFFEEEEEE),
+            width: _isRequested ? 1.5 : 1,
+          ),
+          boxShadow: [
+            BoxShadow(
+              color: Colors.black.withOpacity(0.04),
+              blurRadius: 8,
+              offset: const Offset(0, 2),
+            ),
+          ],
+        ),
+        child: Column(
+          children: [
+            // ── Main content ──────────────────────────────────────────────
+            Padding(
+              padding: const EdgeInsets.all(16),
+              child: Column(
+                children: [
+                  Row(
+                    children: [
+                      Container(
+                        width: 46,
+                        height: 46,
+                        decoration: BoxDecoration(
+                          color: const Color(0xFFFF6B35).withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(12),
+                        ),
+                        child: const Icon(
+                          Icons.inventory_2_outlined,
+                          color: Color(0xFFFF6B35),
+                          size: 22,
+                        ),
+                      ),
+                      const SizedBox(width: 12),
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          children: [
+                            Row(
+                              children: [
+                                Text(
+                                  d['fromCity'] ?? '',
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF1A1A1A),
+                                  ),
+                                ),
+                                const Padding(
+                                  padding: EdgeInsets.symmetric(horizontal: 6),
+                                  child: Icon(
+                                    Icons.arrow_forward_rounded,
+                                    size: 14,
+                                    color: Color(0xFF888888),
+                                  ),
+                                ),
+                                Text(
+                                  d['toCity'] ?? '',
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF1A1A1A),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 3),
+                            Text(
+                              '${d['description'] ?? 'Parcel'}  •  ${d['weight'] ?? 0} kg',
+                              style: const TextStyle(
+                                fontSize: 12,
+                                color: Color(0xFF888888),
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      // Status chip
+                      Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 4,
+                        ),
+                        decoration: BoxDecoration(
+                          color: _statusColor.withOpacity(0.1),
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: Text(
+                          _statusLabel,
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w700,
+                            color: _statusColor,
+                          ),
+                        ),
+                      ),
+                    ],
+                  ),
+
+                  // ── COUNTDOWN SECTION (only when status == 'requested') ──
+                  if (_isRequested || _expired) ...[
+                    const SizedBox(height: 12),
+                    _CountdownSection(
+                      label: _countdownLabel,
+                      progress: _progress,
+                      color: _timerColor,
+                      expired: _expired,
+                      travelerName: d['travelerName'] as String? ?? 'Traveler',
+                    ),
+                  ],
+
+                  const SizedBox(height: 12),
+                  Divider(color: Colors.grey[100], height: 1),
+                  const SizedBox(height: 10),
+                  Row(
+                    mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                    children: [
+                      Row(
+                        children: [
+                          const Icon(
+                            Icons.currency_rupee,
+                            size: 14,
+                            color: Color(0xFF22C55E),
+                          ),
+                          Text(
+                            '${d['price'] ?? 0}',
+                            style: const TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.bold,
+                              color: Color(0xFF22C55E),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const Row(
+                        children: [
+                          Text(
+                            'Tap to see details',
+                            style: TextStyle(
+                              fontSize: 12,
+                              color: Color(0xFFFF6B35),
+                            ),
+                          ),
+                          SizedBox(width: 4),
+                          Icon(
+                            Icons.arrow_forward_ios_rounded,
+                            size: 11,
+                            color: Color(0xFFFF6B35),
+                          ),
+                        ],
+                      ),
+                    ],
+                  ),
+                ],
+              ),
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  COUNTDOWN SECTION WIDGET
+//  Extracted so the layout is clean and easy to read.
+// ════════════════════════════════════════════════════════════════════════════
+class _CountdownSection extends StatelessWidget {
+  final String label;
+  final double progress;
+  final Color color;
+  final bool expired;
+  final String travelerName;
+
+  const _CountdownSection({
+    required this.label,
+    required this.progress,
+    required this.color,
+    required this.expired,
+    required this.travelerName,
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: double.infinity,
+      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.06),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: color.withOpacity(0.2)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          // ── Top row: icon + traveler name + countdown ──────────────────
+          Row(
+            children: [
+              Icon(
+                expired
+                    ? Icons.timer_off_outlined
+                    : Icons.hourglass_top_rounded,
+                size: 14,
+                color: color,
+              ),
+              const SizedBox(width: 6),
+              Expanded(
+                child: Text(
+                  expired
+                      ? 'No response from $travelerName'
+                      : 'Waiting for $travelerName to respond',
+                  style: TextStyle(
+                    fontSize: 12,
+                    color: color,
+                    fontWeight: FontWeight.w600,
+                  ),
+                ),
+              ),
+              // Live countdown label
+              Container(
+                padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+                decoration: BoxDecoration(
+                  color: color.withOpacity(0.12),
+                  borderRadius: BorderRadius.circular(8),
+                ),
+                child: Text(
+                  label,
+                  style: TextStyle(
+                    fontSize: 11,
+                    fontWeight: FontWeight.w800,
+                    color: color,
+                  ),
+                ),
+              ),
+            ],
+          ),
+
+          const SizedBox(height: 8),
+
+          // ── Progress bar ──────────────────────────────────────────────
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: progress,
+              minHeight: 5,
+              backgroundColor: color.withOpacity(0.12),
+              valueColor: AlwaysStoppedAnimation<Color>(color),
+            ),
+          ),
+
+          const SizedBox(height: 6),
+
+          // ── Helper text ───────────────────────────────────────────────
+          Text(
+            expired
+                ? 'Request expired. You can choose another traveler.'
+                : 'Request auto-cancels if traveler doesn\'t respond in time.',
+            style: TextStyle(
+              fontSize: 10,
+              color: color.withOpacity(0.8),
+              height: 1.3,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  GREETING CARD (unchanged)
+// ════════════════════════════════════════════════════════════════════════════
 class _GreetingCard extends StatelessWidget {
   final User? user;
   const _GreetingCard({required this.user});
@@ -418,7 +844,9 @@ class _GreetingCard extends StatelessWidget {
   }
 }
 
-// ── Stats Row ──────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  STATS ROW (unchanged)
+// ════════════════════════════════════════════════════════════════════════════
 class _StatsRow extends StatelessWidget {
   final String uid;
   const _StatsRow({required this.uid});
@@ -432,7 +860,7 @@ class _StatsRow extends StatelessWidget {
     int pending = 0, active = 0, delivered = 0;
     for (final d in snap.docs) {
       final status = d['status'] as String? ?? '';
-      if (status == 'pending')
+      if (status == 'pending' || status == 'requested')
         pending++;
       else if (status == 'accepted' || status == 'picked')
         active++;
@@ -481,7 +909,6 @@ class _StatCard extends StatelessWidget {
   final String label, value;
   final Color color;
   final IconData icon;
-
   const _StatCard({
     required this.label,
     required this.value,
@@ -530,7 +957,9 @@ class _StatCard extends StatelessWidget {
   }
 }
 
-// ── Quick Actions ──────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  QUICK ACTIONS (unchanged)
+// ════════════════════════════════════════════════════════════════════════════
 class _QuickActions extends StatelessWidget {
   final VoidCallback onSendTap;
   const _QuickActions({required this.onSendTap});
@@ -600,183 +1029,9 @@ class _QuickActions extends StatelessWidget {
   }
 }
 
-// ── Parcel Card ────────────────────────────────────────────────────────────────
-class _ParcelCard extends StatelessWidget {
-  final Map<String, dynamic> data;
-  final String docId;
-  final VoidCallback onTap;
-
-  const _ParcelCard({
-    required this.data,
-    required this.docId,
-    required this.onTap,
-  });
-
-  Color get _statusColor {
-    switch (data['status']) {
-      case 'pending':
-        return const Color(0xFFF59E0B);
-      case 'accepted':
-        return const Color(0xFF3B82F6);
-      case 'picked':
-        return const Color(0xFFFF6B35);
-      case 'delivered':
-        return const Color(0xFF22C55E);
-      default:
-        return const Color(0xFF888888);
-    }
-  }
-
-  String get _statusLabel =>
-      (data['status'] as String? ?? 'pending').toUpperCase();
-
-  @override
-  Widget build(BuildContext context) {
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.all(16),
-        decoration: BoxDecoration(
-          color: Colors.white,
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: const Color(0xFFEEEEEE)),
-          boxShadow: [
-            BoxShadow(
-              color: Colors.black.withOpacity(0.04),
-              blurRadius: 8,
-              offset: const Offset(0, 2),
-            ),
-          ],
-        ),
-        child: Column(
-          children: [
-            Row(
-              children: [
-                Container(
-                  width: 46,
-                  height: 46,
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFFF6B35).withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(12),
-                  ),
-                  child: const Icon(
-                    Icons.inventory_2_outlined,
-                    color: Color(0xFFFF6B35),
-                    size: 22,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Text(
-                            data['fromCity'] ?? '',
-                            style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.bold,
-                              color: Color(0xFF1A1A1A),
-                            ),
-                          ),
-                          const Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 6),
-                            child: Icon(
-                              Icons.arrow_forward_rounded,
-                              size: 14,
-                              color: Color(0xFF888888),
-                            ),
-                          ),
-                          Text(
-                            data['toCity'] ?? '',
-                            style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.bold,
-                              color: Color(0xFF1A1A1A),
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 3),
-                      Text(
-                        '${data['description'] ?? 'Parcel'}  •  ${data['weight'] ?? 0} kg',
-                        style: const TextStyle(
-                          fontSize: 12,
-                          color: Color(0xFF888888),
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 4,
-                  ),
-                  decoration: BoxDecoration(
-                    color: _statusColor.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(8),
-                  ),
-                  child: Text(
-                    _statusLabel,
-                    style: TextStyle(
-                      fontSize: 10,
-                      fontWeight: FontWeight.w700,
-                      color: _statusColor,
-                    ),
-                  ),
-                ),
-              ],
-            ),
-            const SizedBox(height: 12),
-            Divider(color: Colors.grey[100], height: 1),
-            const SizedBox(height: 10),
-            Row(
-              mainAxisAlignment: MainAxisAlignment.spaceBetween,
-              children: [
-                Row(
-                  children: [
-                    const Icon(
-                      Icons.currency_rupee,
-                      size: 14,
-                      color: Color(0xFF22C55E),
-                    ),
-                    Text(
-                      '${data['price'] ?? 0}',
-                      style: const TextStyle(
-                        fontSize: 14,
-                        fontWeight: FontWeight.bold,
-                        color: Color(0xFF22C55E),
-                      ),
-                    ),
-                  ],
-                ),
-                const Row(
-                  children: [
-                    Text(
-                      'Tap to see details',
-                      style: TextStyle(fontSize: 12, color: Color(0xFFFF6B35)),
-                    ),
-                    SizedBox(width: 4),
-                    Icon(
-                      Icons.arrow_forward_ios_rounded,
-                      size: 11,
-                      color: Color(0xFFFF6B35),
-                    ),
-                  ],
-                ),
-              ],
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
-// ── Empty State ────────────────────────────────────────────────────────────────
+// ════════════════════════════════════════════════════════════════════════════
+//  EMPTY / ERROR STATES (unchanged)
+// ════════════════════════════════════════════════════════════════════════════
 class _EmptyParcels extends StatelessWidget {
   final VoidCallback onTap;
   const _EmptyParcels({required this.onTap});
@@ -838,7 +1093,6 @@ class _EmptyParcels extends StatelessWidget {
   }
 }
 
-// ── Error State ────────────────────────────────────────────────────────────────
 class _ErrorState extends StatelessWidget {
   final String error;
   const _ErrorState({required this.error});
@@ -866,7 +1120,6 @@ class _ErrorState extends StatelessWidget {
             ),
           ),
           const SizedBox(height: 6),
-          // ✅ Shows the Firestore index creation link in the UI
           const Text(
             'Check debug console for a Firestore index link.\nTap it to auto-create the required index.',
             textAlign: TextAlign.center,

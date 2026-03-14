@@ -6,6 +6,10 @@ import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 import 'pickup_otp_verify_screen.dart'; // <-- import the OTP screen
 
+// 👇 NEW: import tracking services
+import '../../tracking/permission_service.dart';
+import '../../tracking/tracking_service.dart';
+
 // ── Brand colours ─────────────────────────────────────────────────────────────
 const _indigo = Color(0xFF4F46E5);
 const _teal = Color(0xFF14B8A6);
@@ -39,6 +43,13 @@ class _TravelerParcelDetailsScreenState
     _loadParcel();
   }
 
+  // 👇 NEW: dispose method to stop tracking when screen is destroyed
+  @override
+  void dispose() {
+    TrackingService.instance.stopTracking();
+    super.dispose();
+  }
+
   Future<void> _loadParcel() async {
     try {
       final doc = await FirebaseFirestore.instance
@@ -57,12 +68,31 @@ class _TravelerParcelDetailsScreenState
         _parcel = doc.data();
         _loading = false;
       });
+
+      // 👇 NEW: if parcel is already picked, start tracking automatically
+      if (_parcel?['status'] == 'picked') {
+        _startTrackingIfPicked();
+      }
     } catch (e) {
       setState(() {
         _error = e.toString();
         _loading = false;
       });
     }
+  }
+
+  // 👇 NEW: method to request permissions and start tracking
+  Future<void> _startTrackingIfPicked() async {
+    final ready = await PermissionService.ensureLocationReady(context);
+    if (!ready) {
+      _showToast(
+        'Cannot start tracking without location access',
+        isError: true,
+      );
+      return;
+    }
+    await TrackingService.instance.startTracking(widget.parcelId);
+    debugPrint('Tracking started for parcel ${widget.parcelId}');
   }
 
   String _generateOTP() {
@@ -147,7 +177,7 @@ class _TravelerParcelDetailsScreenState
 
       // Reload parcel if OTP was verified successfully
       if (verified == true && mounted) {
-        await _loadParcel();
+        await _loadParcel(); // This will trigger tracking if status becomes 'picked'
       }
     } catch (e) {
       setState(() => _updating = false);
@@ -165,6 +195,10 @@ class _TravelerParcelDetailsScreenState
             'status': 'delivered',
             'deliveredAt': FieldValue.serverTimestamp(),
           });
+
+      // 👇 NEW: stop tracking because parcel is delivered
+      await TrackingService.instance.stopTracking();
+
       setState(() {
         _parcel!['status'] = 'delivered';
         _updating = false;

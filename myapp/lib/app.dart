@@ -15,6 +15,7 @@ import 'features/sender/screens/available_travelers_screen.dart';
 import 'features/sender/screens/parcel_details.dart';
 import 'features/payment/payment_screen.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'features/admin//screens/admin_home_screen.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTER
@@ -61,6 +62,10 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: '/create-parcel',
         builder: (_, __) => const CreateParcelScreen(),
+      ),
+      GoRoute(
+        path: '/admin_home',
+        builder: (context, state) => const AdminHomeScreen(),
       ),
       GoRoute(
         path: '/available-traveler/:parcelId',

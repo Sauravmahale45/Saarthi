@@ -1,22 +1,27 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  available_travelers_screen.dart  –  Saarthi (UPDATED v2)
+//  available_travelers_screen.dart  –  Saarthi (UPDATED v4)
 //
-//  CHANGES FROM v1:
-//   1. ignoredTravelers support  – filtered out from list
-//   2. Race-condition guard      – read-before-write in _requestTraveler()
-//   3. Unstuck sender            – allow re-request when status == 'requested'
-//                                  and the assigned traveler is not this one
-//   4. Empty travelerId guard    – skip if travelerId is null / empty
-//   5. Real-time parcel updates  – replaced .get() with .snapshots() StreamBuilder
-//   6. Invalid traveler filter   – _filterRoutes() rejects missing travelerId
+//  NEW IN v4:
+//   • 15-minute request-expiry timer running on the SENDER's side.
+//   • When the timer fires (or screen opens and request is already stale):
+//       – status       → 'pending'
+//       – travelerId   → null
+//       – travelerName → null
+//       – ignoredTravelers → arrayUnion([that traveler's id])
+//   • Timer is cancelled whenever the screen is disposed or the parcel
+//     status changes away from 'requested'.
+//   • _checkAndHandleExpiry() also runs every time a new parcel snapshot
+//     arrives, so the screen self-heals even if the timer already fired.
 // ════════════════════════════════════════════════════════════════════════════
+
+import 'dart:async';
 
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 
-// ── Brand colours (same as app) ───────────────────────────────────────────────
+// ── Brand colours ─────────────────────────────────────────────────────────────
 const _indigo = Color(0xFF4F46E5);
 const _teal = Color(0xFF14B8A6);
 const _orange = Color(0xFFF97316);
@@ -25,6 +30,9 @@ const _text1 = Color(0xFF0F172A);
 const _text2 = Color(0xFF64748B);
 const _green = Color(0xFF22C55E);
 const _red = Color(0xFFEF4444);
+
+/// How long a request is considered valid before auto-expiry.
+const _kRequestExpiry = Duration(minutes: 15);
 
 // ════════════════════════════════════════════════════════════════════════════
 //  SCREEN
@@ -39,34 +47,45 @@ class AvailableTravelersScreen extends StatefulWidget {
 }
 
 class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
-  // ── IMPROVEMENT 5: Parcel is now a real-time stream, not a one-shot .get() ──
-  // _parcel and _loadingParcel are kept for the parcel stream snapshot caching
-  // so the rest of the build tree can read them synchronously.
+  // ── Parcel state ──────────────────────────────────────────────────────────
   Map<String, dynamic>? _parcel;
   bool _loadingParcel = true;
   String? _error;
 
-  // ── IMPROVEMENT 1: ignoredTravelers list ──────────────────────────────────
   List<String> _ignoredTravelers = [];
-
-  // ── Request state ──────────────────────────────────────────────────────────
   String? _requestingTravelerId;
   String? _assignedTravelerId;
 
-  // ── Parcel real-time subscription ──────────────────────────────────────────
+  // ── Real-time parcel stream ───────────────────────────────────────────────
   Stream<DocumentSnapshot>? _parcelStream;
+
+  // ── 15-minute expiry timer (sender side) ──────────────────────────────────
+  Timer? _expiryTimer;
+
+  // ── Countdown display (so sender can see how much time is left) ───────────
+  Duration _timeRemaining = Duration.zero;
+  Timer? _countdownTicker;
 
   @override
   void initState() {
     super.initState();
-    // IMPROVEMENT 5: subscribe to parcel document instead of one-shot .get()
     _parcelStream = FirebaseFirestore.instance
         .collection('parcels')
         .doc(widget.parcelId)
         .snapshots();
   }
 
-  // ── Parse a parcel snapshot into local state ───────────────────────────────
+  @override
+  void dispose() {
+    _expiryTimer?.cancel();
+    _countdownTicker?.cancel();
+    super.dispose();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  APPLY PARCEL SNAPSHOT
+  //  Called every time Firestore sends a new version of the parcel doc.
+  // ══════════════════════════════════════════════════════════════════════════
   void _applyParcelSnapshot(DocumentSnapshot snap) {
     if (!snap.exists) {
       setState(() {
@@ -75,17 +94,117 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
       });
       return;
     }
+
     final data = snap.data() as Map<String, dynamic>;
+
     setState(() {
       _parcel = data;
       _assignedTravelerId = data['travelerId'] as String?;
-      // IMPROVEMENT 1: load ignoredTravelers from Firestore
       _ignoredTravelers = List<String>.from(data['ignoredTravelers'] ?? []);
       _loadingParcel = false;
     });
+
+    // Every time we get a fresh snapshot, re-evaluate the expiry state.
+    _checkAndHandleExpiry(data);
   }
 
-  // ── Build travelRoutes stream ──────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  //  EXPIRY LOGIC  (the heart of this update)
+  // ══════════════════════════════════════════════════════════════════════════
+
+  /// Called whenever the parcel snapshot changes.
+  /// • If status == 'requested' and requestedAt > 15 min ago → expire NOW.
+  /// • If status == 'requested' and still within window → arm a precise timer.
+  /// • Otherwise → cancel any running timer.
+  void _checkAndHandleExpiry(Map<String, dynamic> data) {
+    final status = data['status'] as String? ?? 'pending';
+
+    if (status != 'requested') {
+      // Not in a requested state – cancel any lingering timer.
+      _cancelExpiryTimer();
+      return;
+    }
+
+    final requestedAt = data['requestedAt'] as Timestamp?;
+    if (requestedAt == null) {
+      // No timestamp → can't calculate expiry, leave as-is.
+      return;
+    }
+
+    final elapsed = DateTime.now().difference(requestedAt.toDate());
+
+    if (elapsed >= _kRequestExpiry) {
+      // Already expired when this snapshot arrived → expire immediately.
+      _cancelExpiryTimer();
+      _expireRequest(data);
+    } else {
+      // Not yet expired → set a precise timer for the remaining window.
+      final remaining = _kRequestExpiry - elapsed;
+      _armExpiryTimer(remaining, data);
+    }
+  }
+
+  /// Arms (or re-arms) the expiry timer for [remaining] duration.
+  void _armExpiryTimer(Duration remaining, Map<String, dynamic> data) {
+    // Cancel the old timer first to avoid double-fires.
+    _expiryTimer?.cancel();
+    _countdownTicker?.cancel();
+
+    // --- Countdown ticker: updates _timeRemaining every second ---
+    setState(() => _timeRemaining = remaining);
+
+    _countdownTicker = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      setState(() {
+        _timeRemaining = _timeRemaining.inSeconds > 0
+            ? _timeRemaining - const Duration(seconds: 1)
+            : Duration.zero;
+      });
+    });
+
+    // --- Main expiry timer fires once after [remaining] ---
+    _expiryTimer = Timer(remaining, () {
+      if (!mounted) return;
+      _expireRequest(data);
+    });
+  }
+
+  /// Cancels both the expiry timer and the countdown ticker.
+  void _cancelExpiryTimer() {
+    _expiryTimer?.cancel();
+    _countdownTicker?.cancel();
+    _expiryTimer = null;
+    _countdownTicker = null;
+    if (mounted) setState(() => _timeRemaining = Duration.zero);
+  }
+
+  /// Performs the Firestore expiry write:
+  ///   status → pending, travelerId → null, ignoredTravelers → arrayUnion
+  Future<void> _expireRequest(Map<String, dynamic> data) async {
+    final travelerId = data['travelerId'] as String?;
+    if (travelerId == null || travelerId.isEmpty) return;
+
+    try {
+      await FirebaseFirestore.instance
+          .collection('parcels')
+          .doc(widget.parcelId)
+          .update({
+            'status': 'pending',
+            'travelerId': null,
+            'travelerName': null,
+            // ← add the ignored traveler so they never appear again
+            'ignoredTravelers': FieldValue.arrayUnion([travelerId]),
+          });
+
+      _toast('⏰ Request expired. You can now choose another traveler.');
+    } catch (e) {
+      debugPrint('_expireRequest error: $e');
+    }
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  TRAVELER STREAM  (only active routes)
+  // ══════════════════════════════════════════════════════════════════════════
   Stream<QuerySnapshot>? _buildTravelersStream() {
     final p = _parcel;
     if (p == null) return null;
@@ -93,10 +212,13 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
         .collection('travelRoutes')
         .where('fromCity', isEqualTo: p['fromCity'])
         .where('toCity', isEqualTo: p['toCity'])
+        .where('status', isEqualTo: 'active')
         .snapshots();
   }
 
-  // ── Client-side filter ────────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  //  CLIENT-SIDE FILTER
+  // ══════════════════════════════════════════════════════════════════════════
   List<QueryDocumentSnapshot> _filterRoutes(
     List<QueryDocumentSnapshot> docs,
     double parcelWeight,
@@ -105,18 +227,13 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
     return docs.where((doc) {
       final d = doc.data() as Map<String, dynamic>;
 
-      // IMPROVEMENT 6: reject missing / empty travelerId
       final travelerId = d['travelerId'] as String?;
       if (travelerId == null || travelerId.isEmpty) return false;
-
-      // IMPROVEMENT 1: exclude ignored travelers
       if (_ignoredTravelers.contains(travelerId)) return false;
 
-      // bagSpaceKg check
       final bagSpace = (d['bagSpaceKg'] as num?)?.toDouble() ?? 0;
       if (bagSpace < parcelWeight) return false;
 
-      // travelDateTime must be today or future
       final ts = d['travelDateTime'] as Timestamp?;
       if (ts != null && ts.toDate().isBefore(now)) return false;
 
@@ -124,9 +241,10 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
     }).toList();
   }
 
-  // ── Request a traveler ────────────────────────────────────────────────────
+  // ══════════════════════════════════════════════════════════════════════════
+  //  REQUEST A TRAVELER
+  // ══════════════════════════════════════════════════════════════════════════
   Future<void> _requestTraveler(String travelerId, String travelerName) async {
-    // IMPROVEMENT 4: guard against empty travelerId
     if (travelerId.isEmpty) return;
 
     setState(() => _requestingTravelerId = travelerId);
@@ -136,7 +254,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           .collection('parcels')
           .doc(widget.parcelId);
 
-      // IMPROVEMENT 2: read-before-write to prevent race conditions
+      // Read-before-write: guard against race condition
       final freshSnap = await parcelRef.get();
       if (!freshSnap.exists) {
         _toast('Parcel no longer exists.', isError: true);
@@ -147,7 +265,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
       final freshData = freshSnap.data() as Map<String, dynamic>;
       final currentStatus = freshData['status'] as String? ?? 'pending';
 
-      // Only allow request if parcel is still pending
       if (currentStatus != 'pending') {
         _toast('Parcel already assigned to another traveler.', isError: true);
         setState(() => _requestingTravelerId = null);
@@ -161,8 +278,8 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
         'requestedAt': FieldValue.serverTimestamp(),
       });
 
-      // Local state is updated by the parcel stream listener automatically,
-      // but we also mirror here for instant UI feedback.
+      // Mirror locally for instant UI feedback.
+      // The real-time stream will confirm shortly after.
       setState(() {
         _assignedTravelerId = travelerId;
         _requestingTravelerId = null;
@@ -170,7 +287,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
         _parcel!['status'] = 'requested';
       });
 
-      _toast('✅ Request sent! The traveler will respond soon.');
+      _toast('✅ Request sent! Traveler has 15 minutes to respond.');
     } catch (e) {
       setState(() => _requestingTravelerId = null);
       _toast('Failed to send request: $e', isError: true);
@@ -195,14 +312,12 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
   // ══════════════════════════════════════════════════════════════════════════
   @override
   Widget build(BuildContext context) {
-    // IMPROVEMENT 5: wrap the whole screen in a parcel StreamBuilder so that
-    // accept / reject by the traveler reflects immediately here.
     return StreamBuilder<DocumentSnapshot>(
       stream: _parcelStream,
       builder: (context, parcelSnap) {
-        // First frame or error
-        if (parcelSnap.connectionState == ConnectionState.waiting &&
-            _loadingParcel) {
+        // First-load spinner
+        if (_loadingParcel &&
+            parcelSnap.connectionState == ConnectionState.waiting) {
           return const Scaffold(
             backgroundColor: _bg,
             body: Center(child: CircularProgressIndicator(color: _indigo)),
@@ -219,9 +334,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           );
         }
 
-        // Apply snapshot to local state (only when data actually changes)
         if (parcelSnap.hasData && parcelSnap.data != null) {
-          // Use addPostFrameCallback to avoid calling setState during build
           WidgetsBinding.instance.addPostFrameCallback((_) {
             if (mounted) _applyParcelSnapshot(parcelSnap.data!);
           });
@@ -249,17 +362,20 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
     );
   }
 
+  // ══════════════════════════════════════════════════════════════════════════
+  //  CONTENT
+  // ══════════════════════════════════════════════════════════════════════════
   Widget _buildContent() {
     final p = _parcel!;
     final weight = (p['weight'] as num?)?.toDouble() ?? 0;
-    final stream = _buildTravelersStream();
     final parcelStatus = p['status'] as String? ?? 'pending';
     final hasTraveler =
         _assignedTravelerId != null && _assignedTravelerId!.isNotEmpty;
+    final travelersStream = _buildTravelersStream();
 
     return CustomScrollView(
       slivers: [
-        // ── Gradient header ───────────────────────────────────────────────────
+        // ── Gradient header ─────────────────────────────────────────────────
         SliverAppBar(
           expandedHeight: 200,
           floating: false,
@@ -289,6 +405,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     mainAxisAlignment: MainAxisAlignment.end,
                     children: [
+                      // Status chip
                       Container(
                         padding: const EdgeInsets.symmetric(
                           horizontal: 10,
@@ -330,7 +447,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                               hasTraveler
                                   ? (parcelStatus == 'accepted'
                                         ? 'Traveler Assigned'
-                                        : 'Request Sent')
+                                        : 'Request Sent – waiting…')
                                   : 'Finding Travelers',
                               style: TextStyle(
                                 fontSize: 11,
@@ -363,10 +480,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                             child: Container(
                               width: 28,
                               height: 2,
-                              decoration: BoxDecoration(
-                                color: Colors.white54,
-                                borderRadius: BorderRadius.circular(2),
-                              ),
+                              color: Colors.white54,
                             ),
                           ),
                           const Icon(
@@ -379,10 +493,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                             child: Container(
                               width: 28,
                               height: 2,
-                              decoration: BoxDecoration(
-                                color: Colors.white54,
-                                borderRadius: BorderRadius.circular(2),
-                              ),
+                              color: Colors.white54,
                             ),
                           ),
                           _RouteChip(label: p['toCity'] ?? ''),
@@ -418,7 +529,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           ),
         ),
 
-        // ── Parcel summary card ───────────────────────────────────────────────
+        // ── Parcel summary card ──────────────────────────────────────────────
         SliverToBoxAdapter(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 16, 16, 0),
@@ -426,7 +537,16 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           ),
         ),
 
-        // ── Section header ────────────────────────────────────────────────────
+        // ── ⏱ COUNTDOWN BANNER (visible only while status == 'requested') ───
+        if (parcelStatus == 'requested' && _timeRemaining.inSeconds > 0)
+          SliverToBoxAdapter(
+            child: Padding(
+              padding: const EdgeInsets.fromLTRB(16, 14, 16, 0),
+              child: _CountdownBanner(remaining: _timeRemaining),
+            ),
+          ),
+
+        // ── Section header ───────────────────────────────────────────────────
         SliverToBoxAdapter(
           child: Padding(
             padding: const EdgeInsets.fromLTRB(16, 22, 16, 10),
@@ -473,75 +593,166 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           ),
         ),
 
-        // ── Traveler list ─────────────────────────────────────────────────────
-        if (stream == null)
-          const SliverToBoxAdapter(child: _NoTravelersCard())
-        else
-          SliverPadding(
-            padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
-            sliver: StreamBuilder<QuerySnapshot>(
-              stream: stream,
-              builder: (ctx, snap) {
-                if (snap.connectionState == ConnectionState.waiting) {
-                  return const SliverToBoxAdapter(
-                    child: Center(
-                      child: Padding(
-                        padding: EdgeInsets.all(40),
-                        child: CircularProgressIndicator(color: _indigo),
-                      ),
-                    ),
-                  );
-                }
-                if (snap.hasError) {
-                  return SliverToBoxAdapter(
-                    child: _ErrorCard(
-                      msg: 'Could not load travelers.\n${snap.error}',
-                    ),
-                  );
-                }
+        // ── Traveler list ────────────────────────────────────────────────────
+        SliverPadding(
+          padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
+          sliver: travelersStream == null
+              ? const SliverToBoxAdapter(child: _NoTravelersCard())
+              : StreamBuilder<QuerySnapshot>(
+                  stream: travelersStream,
+                  builder: (ctx, snap) {
+                    if (snap.connectionState == ConnectionState.waiting &&
+                        !snap.hasData) {
+                      return const SliverToBoxAdapter(
+                        child: Center(
+                          child: Padding(
+                            padding: EdgeInsets.all(40),
+                            child: CircularProgressIndicator(color: _indigo),
+                          ),
+                        ),
+                      );
+                    }
 
-                final filtered = _filterRoutes(snap.data?.docs ?? [], weight);
+                    if (snap.hasError) {
+                      return SliverToBoxAdapter(
+                        child: _ErrorCard(
+                          msg: 'Could not load travelers.\n${snap.error}',
+                        ),
+                      );
+                    }
 
-                if (filtered.isEmpty) {
-                  return const SliverToBoxAdapter(child: _NoTravelersCard());
-                }
+                    final allDocs = snap.data?.docs ?? [];
+                    if (allDocs.isEmpty) {
+                      return const SliverToBoxAdapter(
+                        child: _NoTravelersCard(),
+                      );
+                    }
 
-                return SliverList(
-                  delegate: SliverChildBuilderDelegate((ctx, i) {
-                    final doc = filtered[i];
-                    final data = doc.data() as Map<String, dynamic>;
-                    final tid = data['travelerId'] as String? ?? '';
-                    final isAssigned = _assignedTravelerId == tid;
-                    final isRequesting = _requestingTravelerId == tid;
-                    final isAccepted = isAssigned && parcelStatus == 'accepted';
-                    final isRequested =
-                        isAssigned && parcelStatus == 'requested';
+                    final filtered = _filterRoutes(allDocs, weight);
+                    if (filtered.isEmpty) {
+                      return const SliverToBoxAdapter(
+                        child: _NoTravelersCard(),
+                      );
+                    }
 
-                    // IMPROVEMENT 3: alreadyHasTraveler is true ONLY when
-                    // status == 'accepted' (fully locked in).
-                    // When status == 'requested' the sender can still
-                    // request a DIFFERENT traveler (allows unstuck flow).
-                    final alreadyHasTraveler =
-                        parcelStatus == 'accepted' && !isAssigned;
+                    return SliverList(
+                      delegate: SliverChildBuilderDelegate((ctx, i) {
+                        final doc = filtered[i];
+                        final data = doc.data() as Map<String, dynamic>;
+                        final tid = data['travelerId'] as String? ?? '';
+                        final isAssigned = _assignedTravelerId == tid;
+                        final isRequesting = _requestingTravelerId == tid;
+                        final isAccepted =
+                            isAssigned && parcelStatus == 'accepted';
+                        final isRequested =
+                            isAssigned && parcelStatus == 'requested';
+                        final alreadyHasTraveler =
+                            parcelStatus == 'accepted' && !isAssigned;
 
-                    return _TravelerCard(
-                      routeData: data,
-                      isAssigned: isAssigned,
-                      isAccepted: isAccepted,
-                      isRequested: isRequested,
-                      isRequesting: isRequesting,
-                      alreadyHasTraveler: alreadyHasTraveler,
-                      onRequest: () => _requestTraveler(
-                        tid,
-                        data['travelerName'] as String? ?? '',
-                      ),
+                        return _TravelerCard(
+                          routeData: data,
+                          isAssigned: isAssigned,
+                          isAccepted: isAccepted,
+                          isRequested: isRequested,
+                          isRequesting: isRequesting,
+                          alreadyHasTraveler: alreadyHasTraveler,
+                          onRequest: () => _requestTraveler(
+                            tid,
+                            data['travelerName'] as String? ?? '',
+                          ),
+                        );
+                      }, childCount: filtered.length),
                     );
-                  }, childCount: filtered.length),
-                );
-              },
+                  },
+                ),
+        ),
+      ],
+    );
+  }
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  COUNTDOWN BANNER WIDGET
+//  Shows a live "X min Y sec remaining" bar to the sender.
+// ════════════════════════════════════════════════════════════════════════════
+class _CountdownBanner extends StatelessWidget {
+  final Duration remaining;
+  const _CountdownBanner({required this.remaining});
+
+  String get _label {
+    final m = remaining.inMinutes;
+    final s = remaining.inSeconds % 60;
+    if (m > 0) return '$m min ${s.toString().padLeft(2, '0')} sec remaining';
+    return '${s}s remaining';
+  }
+
+  double get _progress => remaining.inSeconds / _kRequestExpiry.inSeconds;
+
+  Color get _color {
+    if (_progress > 0.5) return _orange;
+    if (_progress > 0.2) return const Color(0xFFEF8C34);
+    return _red;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        color: _color.withOpacity(0.07),
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: _color.withOpacity(0.3)),
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            children: [
+              Icon(Icons.hourglass_top_rounded, color: _color, size: 16),
+              const SizedBox(width: 8),
+              Expanded(
+                child: Text(
+                  'Waiting for traveler response',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                    color: _color,
+                  ),
+                ),
+              ),
+              Text(
+                _label,
+                style: TextStyle(
+                  fontSize: 12,
+                  fontWeight: FontWeight.w700,
+                  color: _color,
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 10),
+          ClipRRect(
+            borderRadius: BorderRadius.circular(4),
+            child: LinearProgressIndicator(
+              value: _progress.clamp(0.0, 1.0),
+              minHeight: 5,
+              backgroundColor: _color.withOpacity(0.15),
+              valueColor: AlwaysStoppedAnimation<Color>(_color),
             ),
           ),
-      ],
+          const SizedBox(height: 8),
+          Text(
+            'If the traveler does not respond, '
+            'the request will expire automatically '
+            'and they will be added to the ignored list.',
+            style: TextStyle(
+              fontSize: 11,
+              color: _color.withOpacity(0.85),
+              height: 1.4,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -553,43 +764,31 @@ class _ParcelSummaryCard extends StatelessWidget {
   final Map<String, dynamic> parcel;
   const _ParcelSummaryCard({required this.parcel});
 
-  Color _statusColor(String? status) {
-    switch (status) {
-      case 'accepted':
-        return _green;
-      case 'requested':
-        return _orange;
-      default:
-        return _text2;
-    }
+  Color _statusColor(String? s) {
+    if (s == 'accepted') return _green;
+    if (s == 'requested') return _orange;
+    return _text2;
   }
 
-  String _statusText(String? status) {
-    switch (status) {
-      case 'accepted':
-        return '✅ Assigned';
-      case 'requested':
-        return '⏳ Request Sent';
-      default:
-        return '⏳ Pending';
-    }
+  String _statusText(String? s) {
+    if (s == 'accepted') return '✅ Assigned';
+    if (s == 'requested') return '⏳ Request Sent';
+    return '⏳ Pending';
   }
 
   @override
   Widget build(BuildContext context) {
     final status = parcel['status'] as String? ?? 'pending';
     final hasTraveler = (parcel['travelerId'] as String?)?.isNotEmpty ?? false;
-    final statusColor = _statusColor(status);
+    final sc = _statusColor(status);
 
     return Container(
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
-        color: hasTraveler ? statusColor.withOpacity(0.04) : Colors.white,
+        color: hasTraveler ? sc.withOpacity(0.04) : Colors.white,
         borderRadius: BorderRadius.circular(18),
         border: Border.all(
-          color: hasTraveler
-              ? statusColor.withOpacity(0.3)
-              : const Color(0xFFE2E8F0),
+          color: hasTraveler ? sc.withOpacity(0.3) : const Color(0xFFE2E8F0),
         ),
         boxShadow: [
           BoxShadow(
@@ -645,16 +844,16 @@ class _ParcelSummaryCard extends StatelessWidget {
                   vertical: 6,
                 ),
                 decoration: BoxDecoration(
-                  color: statusColor.withOpacity(0.08),
+                  color: sc.withOpacity(0.08),
                   borderRadius: BorderRadius.circular(10),
-                  border: Border.all(color: statusColor.withOpacity(0.2)),
+                  border: Border.all(color: sc.withOpacity(0.2)),
                 ),
                 child: Text(
                   _statusText(status),
                   style: TextStyle(
                     fontSize: 11,
                     fontWeight: FontWeight.w700,
-                    color: statusColor,
+                    color: sc,
                   ),
                 ),
               ),
@@ -730,11 +929,11 @@ class _ParcelSummaryCard extends StatelessWidget {
 // ════════════════════════════════════════════════════════════════════════════
 class _TravelerCard extends StatelessWidget {
   final Map<String, dynamic> routeData;
-  final bool isAssigned;
-  final bool isAccepted;
-  final bool isRequested;
-  final bool isRequesting;
-  final bool alreadyHasTraveler;
+  final bool isAssigned,
+      isAccepted,
+      isRequested,
+      isRequesting,
+      alreadyHasTraveler;
   final VoidCallback onRequest;
 
   const _TravelerCard({
@@ -819,7 +1018,7 @@ class _TravelerCard extends StatelessWidget {
       ),
       child: Column(
         children: [
-          // ── Top section ────────────────────────────────────────────────────
+          // Top row
           Padding(
             padding: const EdgeInsets.all(16),
             child: Row(
@@ -876,44 +1075,8 @@ class _TravelerCard extends StatelessWidget {
                               ),
                             ),
                           ),
-                          if (isAccepted)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 3,
-                              ),
-                              decoration: BoxDecoration(
-                                color: _green.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: const Text(
-                                'Assigned ✓',
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w700,
-                                  color: _green,
-                                ),
-                              ),
-                            ),
-                          if (isRequested)
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 8,
-                                vertical: 3,
-                              ),
-                              decoration: BoxDecoration(
-                                color: _orange.withOpacity(0.1),
-                                borderRadius: BorderRadius.circular(8),
-                              ),
-                              child: const Text(
-                                'Requested ⏳',
-                                style: TextStyle(
-                                  fontSize: 10,
-                                  fontWeight: FontWeight.w700,
-                                  color: _orange,
-                                ),
-                              ),
-                            ),
+                          if (isAccepted) _Badge('Assigned ✓', _green),
+                          if (isRequested) _Badge('Requested ⏳', _orange),
                         ],
                       ),
                       const SizedBox(height: 4),
@@ -942,7 +1105,7 @@ class _TravelerCard extends StatelessWidget {
             ),
           ),
 
-          // ── Stats row ──────────────────────────────────────────────────────
+          // Stats row
           Container(
             margin: const EdgeInsets.symmetric(horizontal: 16),
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
@@ -977,7 +1140,7 @@ class _TravelerCard extends StatelessWidget {
           ),
           const SizedBox(height: 14),
 
-          // ── Action button ──────────────────────────────────────────────────
+          // Action button
           Padding(
             padding: const EdgeInsets.fromLTRB(16, 0, 16, 16),
             child: SizedBox(
@@ -1073,21 +1236,41 @@ class _TravelerCard extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  EMPTY / ERROR WIDGETS (unchanged)
+//  SHARED SMALL WIDGETS
 // ════════════════════════════════════════════════════════════════════════════
+class _Badge extends StatelessWidget {
+  final String label;
+  final Color color;
+  const _Badge(this.label, this.color);
+
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
+    decoration: BoxDecoration(
+      color: color.withOpacity(0.1),
+      borderRadius: BorderRadius.circular(8),
+    ),
+    child: Text(
+      label,
+      style: TextStyle(fontSize: 10, fontWeight: FontWeight.w700, color: color),
+    ),
+  );
+}
+
 class _NoTravelersCard extends StatelessWidget {
   const _NoTravelersCard();
 
   @override
   Widget build(BuildContext context) => Container(
-    margin: const EdgeInsets.symmetric(horizontal: 0, vertical: 8),
-    padding: const EdgeInsets.all(32),
+    margin: const EdgeInsets.symmetric(vertical: 8),
+    padding: const EdgeInsets.symmetric(vertical: 40, horizontal: 24),
     decoration: BoxDecoration(
       color: Colors.white,
       borderRadius: BorderRadius.circular(20),
       border: Border.all(color: const Color(0xFFE2E8F0)),
     ),
     child: Column(
+      mainAxisSize: MainAxisSize.min,
       children: [
         Container(
           width: 72,
@@ -1113,8 +1296,10 @@ class _NoTravelersCard extends StatelessWidget {
         ),
         const SizedBox(height: 8),
         const Text(
-          'No travelers are heading this route with\nsufficient bag space right now.\n\n'
-          'Your parcel will be matched automatically\nwhen a traveler registers this route.',
+          'No travelers are heading this route with\n'
+          'sufficient bag space right now.\n\n'
+          'Your parcel will be matched automatically\n'
+          'when a traveler registers this route.',
           textAlign: TextAlign.center,
           style: TextStyle(fontSize: 13, color: _text2, height: 1.6),
         ),
@@ -1212,9 +1397,6 @@ class _ErrorView extends StatelessWidget {
   );
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  SMALL REUSABLE WIDGETS (unchanged)
-// ════════════════════════════════════════════════════════════════════════════
 class _RouteChip extends StatelessWidget {
   final String label;
   const _RouteChip({required this.label});

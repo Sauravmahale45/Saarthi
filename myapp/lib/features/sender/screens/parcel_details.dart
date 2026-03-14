@@ -5,6 +5,9 @@ import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
 
+// 👇 NEW: import the live tracking screen
+import '../../tracking/parcel_tracking_screen.dart';
+
 // ── Brand colours (same as app) ───────────────────────────────────────────────
 const _indigo = Color(0xFF4F46E5);
 const _teal = Color(0xFF14B8A6);
@@ -61,17 +64,18 @@ class _ParcelDetailsScreenState extends State<ParcelDetailsScreen> {
               _parcel = data;
               _loading = false;
             });
-
             final travelerId = data['travelerId'] as String?;
             final status = data['status'] as String?;
+
             if (travelerId != null &&
-                (status == 'requested' || status == 'accepted')) {
+                (status == 'requested' ||
+                    status == 'accepted' ||
+                    status == 'picked')) {
               if (travelerId != _previousTravelerId) {
                 _previousTravelerId = travelerId;
                 _fetchTraveler(travelerId);
               }
             } else {
-              // Clear traveler if not needed
               setState(() => _traveler = null);
             }
           },
@@ -373,7 +377,14 @@ class _ParcelDetailsScreenState extends State<ParcelDetailsScreen> {
               ],
             )
           else if (status == 'picked')
-            _buildPickedFooter()
+            // 👇 NEW: added track button below the existing payment button
+            Column(
+              children: [
+                _buildPickedFooter(), // your original payment button
+                const SizedBox(height: 10),
+                _buildTrackButton(), // 👈 new live tracking button
+              ],
+            )
           else if (status == 'delivered')
             _buildDeliveredBadge(),
         ],
@@ -695,6 +706,49 @@ class _ParcelDetailsScreenState extends State<ParcelDetailsScreen> {
               style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
             ),
           ],
+        ),
+      ),
+    );
+  }
+
+  // 👇 NEW: Live tracking button for sender (shown only when status = 'picked')
+  Widget _buildTrackButton() {
+    if (_traveler == null) return const SizedBox.shrink();
+    final destLat = (_parcel!['toLat'] as num?)?.toDouble() ?? 0.0;
+    final destLng = (_parcel!['toLng'] as num?)?.toDouble() ?? 0.0;
+    final destLabel = _parcel!['toCity'] ?? 'Destination';
+    final travelerName =
+        _traveler!['name'] ?? _traveler!['displayName'] ?? 'Traveler';
+
+    return SizedBox(
+      width: double.infinity,
+      child: OutlinedButton.icon(
+        onPressed: () {
+          Navigator.push(
+            context,
+            MaterialPageRoute(
+              builder: (_) => ParcelTrackingScreen(
+                parcelId: widget.parcelId,
+                destLat: destLat,
+                destLng: destLng,
+                destLabel: destLabel,
+                travelerName: travelerName,
+              ),
+            ),
+          );
+        },
+        icon: const Icon(Icons.location_on_rounded, size: 18),
+        label: const Text(
+          'Track Parcel Live',
+          style: TextStyle(fontSize: 16, fontWeight: FontWeight.bold),
+        ),
+        style: OutlinedButton.styleFrom(
+          foregroundColor: _indigo,
+          side: const BorderSide(color: _indigo),
+          padding: const EdgeInsets.symmetric(vertical: 16),
+          shape: RoundedRectangleBorder(
+            borderRadius: BorderRadius.circular(16),
+          ),
         ),
       ),
     );

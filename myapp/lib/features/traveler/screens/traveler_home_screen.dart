@@ -1,3 +1,4 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
@@ -22,9 +23,12 @@ const _green = Color(0xFF22C55E);
 const _red = Color(0xFFEF4444);
 const _card = Colors.white;
 
-// ── Cloudinary config – replace with your values ─────────────────────────────
-const _cloudName = 'dwjzuw8fd'; // e.g. 'dxyz1234'
-const _uploadPreset = 'kyc_upload'; // unsigned preset you created
+// ── Cloudinary config ─────────────────────────────────────────────────────────
+const _cloudName = 'dwjzuw8fd';
+const _uploadPreset = 'kyc_upload';
+
+/// How long a traveler has to respond before the request auto-expires.
+const _kRequestExpiry = Duration(minutes: 15);
 
 // ════════════════════════════════════════════════════════════════════════════
 //  ROOT SCREEN
@@ -37,46 +41,25 @@ class TravelerHomeScreen extends StatefulWidget {
 }
 
 class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
-  // ── Auth ──────────────────────────────────────────────────────────────────
   final User? _user = FirebaseAuth.instance.currentUser;
 
-  // ── Nav ───────────────────────────────────────────────────────────────────
   int _navIndex = 0;
+  bool _kycVerified = false;
+  bool _locationGranted = false;
+  bool _loading = true;
 
-  // ── Verification flags (loaded from Firestore on init) ───────────────────
-  bool _kycVerified = false; // true  = doc uploaded & stored
-  bool _locationGranted = false; // true  = GPS permission + position saved
-  bool _loading = true; // shows spinner while we fetch from Firestore
-
-  // ── Parcel filters ────────────────────────────────────────────────────────
-  String _fromFilter = 'All';
-  String _toFilter = 'All';
-  static const _cities = [
-    'All',
-    'Nashik',
-    'Pune',
-    'Mumbai',
-    'Aurangabad',
-    'Nagpur',
-  ];
-
-  // ══════════════════════════════════════════════════════════════════════════
-  //  LIFECYCLE
-  // ══════════════════════════════════════════════════════════════════════════
   @override
   void initState() {
     super.initState();
     _syncVerificationFromFirestore();
   }
 
-  // ── Step 1 of init: read persisted verification flags from Firestore ──────
   Future<void> _syncVerificationFromFirestore() async {
     final uid = _user?.uid;
     if (uid == null) {
       setState(() => _loading = false);
       return;
     }
-
     try {
       final snap = await FirebaseFirestore.instance
           .collection('users')
@@ -93,25 +76,17 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
     }
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  //  REAL LOCATION  –  Geolocator full flow
-  // ══════════════════════════════════════════════════════════════════════════
   Future<void> _requestRealLocation() async {
-    // 1. Are location services (GPS) enabled at device level?
     final serviceOn = await Geolocator.isLocationServiceEnabled();
     if (!serviceOn) {
       _toast(
         '📍 Please turn on Location / GPS in your device settings.',
         isError: true,
       );
-      await Geolocator.openLocationSettings(); // deep-link to Settings
+      await Geolocator.openLocationSettings();
       return;
     }
-
-    // 2. Check current permission state
     LocationPermission perm = await Geolocator.checkPermission();
-
-    // 3. Permanently denied → can only open app settings
     if (perm == LocationPermission.deniedForever) {
       _toast(
         'Location blocked. Open Settings and allow location for Saarthi.',
@@ -120,8 +95,6 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
       await openAppSettings();
       return;
     }
-
-    // 4. Not yet asked (or previously denied) → request
     if (perm == LocationPermission.denied) {
       perm = await Geolocator.requestPermission();
       if (perm == LocationPermission.denied ||
@@ -130,16 +103,12 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
         return;
       }
     }
-
-    // 5. Permission granted – get actual GPS fix
     try {
       _toast('📍 Getting your location…');
       final Position pos = await Geolocator.getCurrentPosition(
         desiredAccuracy: LocationAccuracy.high,
         timeLimit: const Duration(seconds: 15),
       );
-
-      // 6. Persist to Firestore
       await FirebaseFirestore.instance.collection('users').doc(_user!.uid).set({
         'locationGranted': true,
         'lastLatitude': pos.latitude,
@@ -147,11 +116,9 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
         'locationAccuracy': pos.accuracy,
         'locationUpdatedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
-
       setState(() => _locationGranted = true);
       _toast(
-        '📍 Location saved (${pos.latitude.toStringAsFixed(4)}, '
-        '${pos.longitude.toStringAsFixed(4)})',
+        '📍 Location saved (${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)})',
       );
     } on LocationServiceDisabledException {
       _toast('GPS is disabled.', isError: true);
@@ -162,65 +129,49 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
     }
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  //  ACCEPT PARCEL  –  guarded by both KYC + location
-  // ══════════════════════════════════════════════════════════════════════════
-  Future<void> _acceptParcel(String parcelId) async {
-    if (!_kycVerified || !_locationGranted) {
-      _showSetupSheet(); // redirect to setup
-      return;
-    }
-    try {
-      await FirebaseFirestore.instance
-          .collection('parcels')
-          .doc(parcelId)
-          .update({
-            'status': 'accepted',
-            'travelerId': _user?.uid,
-            'travelerName': _user?.displayName ?? '',
-            'acceptedAt': FieldValue.serverTimestamp(),
-          });
-      _toast('✅ Parcel accepted! Contact sender for pickup.');
-    } catch (e) {
-      _toast('Failed to accept: $e', isError: true);
-    }
-  }
-
-  // ── Update delivery status ─────────────────────────────────────────────────
   Future<void> _updateDeliveryStatus(String parcelId, String newStatus) async {
     await FirebaseFirestore.instance.collection('parcels').doc(parcelId).update(
       {'status': newStatus, 'updatedAt': FieldValue.serverTimestamp()},
     );
+    if (newStatus == 'delivered') {
+      await _markRouteInactive(parcelId);
+    }
   }
 
-  // ── Sign out ───────────────────────────────────────────────────────────────
+  Future<void> _markRouteInactive(String parcelId) async {
+    try {
+      final parcelSnap = await FirebaseFirestore.instance
+          .collection('parcels')
+          .doc(parcelId)
+          .get();
+      if (!parcelSnap.exists) return;
+      final data = parcelSnap.data()!;
+      final travelerId = data['travelerId'] as String?;
+      final fromCity = data['fromCity'] as String?;
+      final toCity = data['toCity'] as String?;
+      if (travelerId == null) return;
+      final routeQuery = await FirebaseFirestore.instance
+          .collection('travelRoutes')
+          .where('travelerId', isEqualTo: travelerId)
+          .where('fromCity', isEqualTo: fromCity)
+          .where('toCity', isEqualTo: toCity)
+          .where('status', isEqualTo: 'active')
+          .limit(1)
+          .get();
+      if (routeQuery.docs.isNotEmpty) {
+        await routeQuery.docs.first.reference.update({'status': 'inactive'});
+      }
+    } catch (e) {
+      debugPrint('_markRouteInactive error: $e');
+    }
+  }
+
   Future<void> _signOut() async {
     await FirebaseAuth.instance.signOut();
     if (mounted) context.go('/login');
   }
 
-  // ══════════════════════════════════════════════════════════════════════════
-  //  FIRESTORE STREAMS
-  //  • _availableParcels  → ONLY status=='pending' AND travelerId == null
-  //  • _incomingRequests  → status=='requested' AND travelerId == current user
-  //  • _myDeliveries      → parcels this traveler has accepted/picked
-  //  • _completedDeliveries → delivered by this traveler
-  // ══════════════════════════════════════════════════════════════════════════
-  Stream<QuerySnapshot> get _availableParcels {
-    // Base query: only pending parcels that have not been taken by any traveler
-    Query q = FirebaseFirestore.instance
-        .collection('parcels')
-        .where('status', isEqualTo: 'pending')
-        .where('travelerId', isEqualTo: null);
-
-    // Optional city filters
-    if (_fromFilter != 'All') q = q.where('fromCity', isEqualTo: _fromFilter);
-    if (_toFilter != 'All') q = q.where('toCity', isEqualTo: _toFilter);
-
-    return q.snapshots();
-  }
-
-  // Incoming requests (new)
+  // ── Firestore streams ──────────────────────────────────────────────────────
   Stream<QuerySnapshot> get _incomingRequests => FirebaseFirestore.instance
       .collection('parcels')
       .where('status', isEqualTo: 'requested')
@@ -245,9 +196,6 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
       .orderBy('travelDateTime', descending: true)
       .snapshots();
 
-  // ══════════════════════════════════════════════════════════════════════════
-  //  UI HELPERS
-  // ══════════════════════════════════════════════════════════════════════════
   void _toast(String msg, {bool isError = false}) {
     if (!mounted) return;
     ScaffoldMessenger.of(context).showSnackBar(
@@ -261,7 +209,6 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
     );
   }
 
-  // ── Setup (KYC + location) bottom sheet ───────────────────────────────────
   void _showSetupSheet() {
     showModalBottomSheet(
       context: context,
@@ -286,13 +233,10 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
     );
   }
 
-  // ── Add travel route bottom sheet (UPDATED) ─────────────────────────
   void _showAddRouteSheet() {
     String from = 'Nashik', to = 'Pune';
     final spaceCtrl = TextEditingController();
     const routeCities = ['Nashik', 'Pune', 'Mumbai', 'Aurangabad', 'Nagpur'];
-
-    // Variables to hold picked date and time
     DateTime? selectedDate;
     TimeOfDay? selectedTime;
 
@@ -330,8 +274,6 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
                 style: TextStyle(fontSize: 13, color: _text2),
               ),
               const SizedBox(height: 20),
-
-              // From / To row (unchanged)
               Row(
                 children: [
                   Expanded(
@@ -367,112 +309,42 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
                 ],
               ),
               const SizedBox(height: 12),
-
-              // ── DATE PICKER (replaces plain text field) ──
               GestureDetector(
                 onTap: () async {
-                  final DateTime? picked = await showDatePicker(
+                  final picked = await showDatePicker(
                     context: context,
                     initialDate: selectedDate ?? DateTime.now(),
                     firstDate: DateTime.now(),
                     lastDate: DateTime.now().add(const Duration(days: 365)),
                   );
-                  if (picked != null) {
-                    ss(() => selectedDate = picked);
-                  }
+                  if (picked != null) ss(() => selectedDate = picked);
                 },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 15,
-                  ),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF8FAFF),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: const Color(0xFFE2E8F0)),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.calendar_today_outlined,
-                        size: 18,
-                        color: _text2,
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          selectedDate != null
-                              ? DateFormat('dd/MM/yyyy').format(selectedDate!)
-                              : 'Select travel date',
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: selectedDate != null ? _text1 : _text2,
-                          ),
-                        ),
-                      ),
-                      const Icon(
-                        Icons.keyboard_arrow_down_rounded,
-                        size: 18,
-                        color: _text2,
-                      ),
-                    ],
-                  ),
+                child: _PickerField(
+                  icon: Icons.calendar_today_outlined,
+                  text: selectedDate != null
+                      ? DateFormat('dd/MM/yyyy').format(selectedDate!)
+                      : 'Select travel date',
+                  hasValue: selectedDate != null,
                 ),
               ),
               const SizedBox(height: 12),
-
-              // ── TIME PICKER (new) ──
               GestureDetector(
                 onTap: () async {
-                  final TimeOfDay? picked = await showTimePicker(
+                  final picked = await showTimePicker(
                     context: context,
                     initialTime: selectedTime ?? TimeOfDay.now(),
                   );
-                  if (picked != null) {
-                    ss(() => selectedTime = picked);
-                  }
+                  if (picked != null) ss(() => selectedTime = picked);
                 },
-                child: Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 16,
-                    vertical: 15,
-                  ),
-                  decoration: BoxDecoration(
-                    color: const Color(0xFFF8FAFF),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: const Color(0xFFE2E8F0)),
-                  ),
-                  child: Row(
-                    children: [
-                      const Icon(
-                        Icons.access_time_outlined,
-                        size: 18,
-                        color: _text2,
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Text(
-                          selectedTime != null
-                              ? selectedTime!.format(context)
-                              : 'Select travel time',
-                          style: TextStyle(
-                            fontSize: 14,
-                            color: selectedTime != null ? _text1 : _text2,
-                          ),
-                        ),
-                      ),
-                      const Icon(
-                        Icons.keyboard_arrow_down_rounded,
-                        size: 18,
-                        color: _text2,
-                      ),
-                    ],
-                  ),
+                child: _PickerField(
+                  icon: Icons.access_time_outlined,
+                  text: selectedTime != null
+                      ? selectedTime!.format(context)
+                      : 'Select travel time',
+                  hasValue: selectedTime != null,
                 ),
               ),
               const SizedBox(height: 12),
-
-              // Bag space field (unchanged)
               _SheetField(
                 ctrl: spaceCtrl,
                 hint: 'Available bag space (kg)',
@@ -480,21 +352,15 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
                 keyboardType: TextInputType.number,
               ),
               const SizedBox(height: 20),
-
-              // Save button with combined date+time
               _PrimaryBtn(
                 label: 'Save Route',
                 onTap: () async {
                   final uid = _user?.uid;
                   if (uid == null) return;
-
-                  // Validate date & time
                   if (selectedDate == null || selectedTime == null) {
                     _toast('Please select both date and time', isError: true);
                     return;
                   }
-
-                  // Combine date and time into a single DateTime
                   final travelDateTime = DateTime(
                     selectedDate!.year,
                     selectedDate!.month,
@@ -502,7 +368,6 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
                     selectedTime!.hour,
                     selectedTime!.minute,
                   );
-
                   await FirebaseFirestore.instance
                       .collection('travelRoutes')
                       .add({
@@ -510,13 +375,11 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
                         'travelerName': _user?.displayName ?? '',
                         'fromCity': from,
                         'toCity': to,
-                        'travelDateTime': Timestamp.fromDate(
-                          travelDateTime,
-                        ), // store as Timestamp
+                        'travelDateTime': Timestamp.fromDate(travelDateTime),
                         'bagSpaceKg': double.tryParse(spaceCtrl.text) ?? 0,
+                        'status': 'active',
                         'createdAt': FieldValue.serverTimestamp(),
                       });
-
                   if (ctx.mounted) Navigator.pop(ctx);
                   _toast('🗺️ Route saved! You\'ll be matched with parcels.');
                 },
@@ -530,7 +393,7 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  HANDLE INCOMING REQUESTS (NEW)
+  //  HANDLE INCOMING REQUESTS
   // ══════════════════════════════════════════════════════════════════════════
   Future<void> _handleRequest(String parcelId, bool accept) async {
     if (!_kycVerified || !_locationGranted) {
@@ -539,6 +402,22 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
     }
     try {
       if (accept) {
+        // Read-before-write guard
+        final freshSnap = await FirebaseFirestore.instance
+            .collection('parcels')
+            .doc(parcelId)
+            .get();
+        if (!freshSnap.exists) {
+          _toast('This request no longer exists.', isError: true);
+          return;
+        }
+        final freshData = freshSnap.data()!;
+        final currentStatus = freshData['status'] as String? ?? '';
+        final currentTravelerId = freshData['travelerId'] as String? ?? '';
+        if (currentStatus != 'requested' || currentTravelerId != _user?.uid) {
+          _toast('This request is no longer available.', isError: true);
+          return;
+        }
         await FirebaseFirestore.instance
             .collection('parcels')
             .doc(parcelId)
@@ -548,7 +427,7 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
             });
         _toast('✅ Request accepted. Contact sender for pickup.');
       } else {
-        // Reject: put back to pending and clear traveler
+        // Reject → add to ignoredTravelers
         await FirebaseFirestore.instance
             .collection('parcels')
             .doc(parcelId)
@@ -556,11 +435,30 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
               'status': 'pending',
               'travelerId': null,
               'travelerName': null,
+              'ignoredTravelers': FieldValue.arrayUnion([_user!.uid]),
             });
-        _toast('⛔ Request rejected. Parcel returned to available list.');
+        _toast('⛔ Request rejected.');
       }
     } catch (e) {
       _toast('Failed: $e', isError: true);
+    }
+  }
+
+  /// Called when a request expires (traveler ignored it for 15 min).
+  /// Resets parcel and adds traveler to ignoredTravelers.
+  Future<void> _expireRequest(String parcelId, String travelerId) async {
+    try {
+      await FirebaseFirestore.instance
+          .collection('parcels')
+          .doc(parcelId)
+          .update({
+            'status': 'pending',
+            'travelerId': null,
+            'travelerName': null,
+            'ignoredTravelers': FieldValue.arrayUnion([travelerId]),
+          });
+    } catch (e) {
+      debugPrint('_expireRequest error: $e');
     }
   }
 
@@ -577,36 +475,25 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
     }
 
     final tabs = [
-      // TAB 0: Home
       _HomeTab(
         user: _user,
         kycVerified: _kycVerified,
         locationGranted: _locationGranted,
-        fromFilter: _fromFilter,
-        toFilter: _toFilter,
-        cities: _cities,
-        availableStream: _availableParcels,
         incomingStream: _incomingRequests,
         activeStream: _myDeliveries,
         completedStream: _completedDeliveries,
-        onFromChanged: (v) => setState(() => _fromFilter = v),
-        onToChanged: (v) => setState(() => _toFilter = v),
-        onAccept: _acceptParcel,
         onHandleRequest: _handleRequest,
+        onExpireRequest: _expireRequest,
         onUpdateStatus: _updateDeliveryStatus,
         onAddRouteTap: _showAddRouteSheet,
         onSetupTap: _showSetupSheet,
       ),
-      // TAB 1: Deliveries
       _DeliveriesTab(
         stream: _myDeliveries,
         onUpdateStatus: _updateDeliveryStatus,
       ),
-      // TAB 2: Wallet
       _WalletTab(completedStream: _completedDeliveries),
-      // TAB 3: Routes (NEW)
       _RoutesTab(stream: _myRoutes),
-      // TAB 4: Profile
       _ProfileTab(
         user: _user,
         kycVerified: _kycVerified,
@@ -616,6 +503,7 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
         onSwitchSender: () => context.go('/sender'),
       ),
     ];
+
     return Scaffold(
       backgroundColor: _bg,
       body: tabs[_navIndex],
@@ -628,7 +516,7 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SETUP SHEET  –  Step 1: real GPS  |  Step 2: real Cloudinary KYC upload
+//  SETUP SHEET (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _SetupSheet extends StatefulWidget {
   final String uid;
@@ -636,7 +524,6 @@ class _SetupSheet extends StatefulWidget {
   final bool kycVerified;
   final Future<void> Function() onLocationTap;
   final VoidCallback onKycVerified;
-
   const _SetupSheet({
     required this.uid,
     required this.locationGranted,
@@ -644,16 +531,14 @@ class _SetupSheet extends StatefulWidget {
     required this.onLocationTap,
     required this.onKycVerified,
   });
-
   @override
   State<_SetupSheet> createState() => _SetupSheetState();
 }
 
 class _SetupSheetState extends State<_SetupSheet> {
-  File? _kycFile; // file chosen from camera / gallery
-  bool _uploading = false; // true while Cloudinary request is in-flight
+  File? _kycFile;
+  bool _uploading = false;
   String _docType = 'Aadhaar Card';
-
   static const _docTypes = [
     'Aadhaar Card',
     'PAN Card',
@@ -662,13 +547,10 @@ class _SetupSheetState extends State<_SetupSheet> {
     'Passport',
   ];
 
-  // ── Pick KYC document image from camera or gallery ─────────────────────
   Future<void> _pickImage(ImageSource source) async {
-    // Request the right permission
     final perm = source == ImageSource.camera
         ? await Permission.camera.request()
         : await Permission.photos.request();
-
     if (!perm.isGranted) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
@@ -682,7 +564,6 @@ class _SetupSheetState extends State<_SetupSheet> {
       await openAppSettings();
       return;
     }
-
     final picked = await ImagePicker().pickImage(
       source: source,
       imageQuality: 85,
@@ -691,7 +572,6 @@ class _SetupSheetState extends State<_SetupSheet> {
     if (picked != null) setState(() => _kycFile = File(picked.path));
   }
 
-  // ── Upload to Cloudinary, save URL to Firestore ───────────────────────
   Future<void> _submitKyc() async {
     if (_kycFile == null) {
       ScaffoldMessenger.of(context).showSnackBar(
@@ -703,15 +583,11 @@ class _SetupSheetState extends State<_SetupSheet> {
       );
       return;
     }
-
     setState(() => _uploading = true);
-
     try {
-      // ── 1. Upload image to Cloudinary (unsigned preset) ─────────────────
       final uri = Uri.parse(
         'https://api.cloudinary.com/v1_1/$_cloudName/image/upload',
       );
-
       final request = http.MultipartRequest('POST', uri)
         ..fields['upload_preset'] = _uploadPreset
         ..fields['folder'] = 'kyc_docs'
@@ -723,36 +599,24 @@ class _SetupSheetState extends State<_SetupSheet> {
             filename: 'kyc_${widget.uid}.jpg',
           ),
         );
-
       final streamed = await request.send().timeout(
         const Duration(seconds: 30),
       );
       final response = await http.Response.fromStream(streamed);
-
       if (response.statusCode != 200) {
         throw Exception(
           'Cloudinary error ${response.statusCode}: ${response.body}',
         );
       }
-
       final body = jsonDecode(response.body) as Map<String, dynamic>;
-      final secureUrl = body['secure_url'] as String;
-      final publicId = body['public_id'] as String;
-
-      // ── 2. Persist URL + metadata to Firestore ───────────────────────────
-      //   kycVerified = true for hackathon auto-approve
-      //   In production set kycVerified = false and let admin approve via
-      //   Cloud Function or admin panel, then update the flag.
       await FirebaseFirestore.instance.collection('users').doc(widget.uid).set({
-        'kycDocUrl': secureUrl,
-        'kycDocPublicId': publicId,
+        'kycDocUrl': body['secure_url'],
+        'kycDocPublicId': body['public_id'],
         'kycDocType': _docType,
-        'kycStatus': 'submitted', // admin changes → 'approved'/'rejected'
-        'kycVerified': true, // auto-approve for demo; remove in prod
+        'kycStatus': 'submitted',
+        'kycVerified': true,
         'kycSubmittedAt': FieldValue.serverTimestamp(),
       }, SetOptions(merge: true));
-
-      // ── 3. Notify parent and close sheet ────────────────────────────────
       widget.onKycVerified();
       if (mounted) Navigator.pop(context);
     } catch (e) {
@@ -770,7 +634,6 @@ class _SetupSheetState extends State<_SetupSheet> {
     }
   }
 
-  // ── Show camera vs gallery picker ────────────────────────────────────────
   void _showSourcePicker() {
     showModalBottomSheet(
       context: context,
@@ -840,8 +703,6 @@ class _SetupSheetState extends State<_SetupSheet> {
           children: [
             _Handle(),
             const SizedBox(height: 20),
-
-            // Icon + heading
             Container(
               width: 62,
               height: 62,
@@ -872,8 +733,6 @@ class _SetupSheetState extends State<_SetupSheet> {
               style: TextStyle(fontSize: 13, color: _text2, height: 1.5),
             ),
             const SizedBox(height: 24),
-
-            // ── STEP 1 : Location ──────────────────────────────────────────
             _StepTile(
               stepNum: '1',
               icon: Icons.location_on_outlined,
@@ -885,8 +744,6 @@ class _SetupSheetState extends State<_SetupSheet> {
               onTap: widget.locationGranted ? null : widget.onLocationTap,
             ),
             const SizedBox(height: 12),
-
-            // ── STEP 2 : KYC document upload ───────────────────────────────
             Container(
               padding: const EdgeInsets.all(16),
               decoration: BoxDecoration(
@@ -903,7 +760,6 @@ class _SetupSheetState extends State<_SetupSheet> {
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
                 children: [
-                  // Step header
                   Row(
                     children: [
                       _StepCircle(num: '2', done: widget.kycVerified),
@@ -951,14 +807,10 @@ class _SetupSheetState extends State<_SetupSheet> {
                       ),
                     ],
                   ),
-
-                  // Only show upload UI when NOT yet verified
                   if (!widget.kycVerified) ...[
                     const SizedBox(height: 16),
                     const Divider(color: Color(0xFFE2E8F0), height: 1),
                     const SizedBox(height: 16),
-
-                    // Document type selector
                     const Text(
                       'Document Type',
                       style: TextStyle(
@@ -1000,8 +852,6 @@ class _SetupSheetState extends State<_SetupSheet> {
                       ),
                     ),
                     const SizedBox(height: 14),
-
-                    // Upload / preview area
                     GestureDetector(
                       onTap: _showSourcePicker,
                       child: AnimatedContainer(
@@ -1106,8 +956,6 @@ class _SetupSheetState extends State<_SetupSheet> {
                       ),
                     ),
                     const SizedBox(height: 14),
-
-                    // Submit button
                     SizedBox(
                       width: double.infinity,
                       height: 50,
@@ -1154,7 +1002,6 @@ class _SetupSheetState extends State<_SetupSheet> {
                 ],
               ),
             ),
-
             const SizedBox(height: 14),
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
@@ -1190,19 +1037,15 @@ class _SetupSheetState extends State<_SetupSheet> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  HOME TAB (updated with incoming requests)
+//  HOME TAB
 // ════════════════════════════════════════════════════════════════════════════
 class _HomeTab extends StatelessWidget {
   final User? user;
   final bool kycVerified, locationGranted;
-  final String fromFilter, toFilter;
-  final List<String> cities;
-  final Stream<QuerySnapshot> availableStream;
-  final Stream<QuerySnapshot> incomingStream; // ← NEW
+  final Stream<QuerySnapshot> incomingStream;
   final Stream<QuerySnapshot> activeStream, completedStream;
-  final void Function(String) onFromChanged, onToChanged;
-  final Future<void> Function(String) onAccept;
-  final Future<void> Function(String, bool) onHandleRequest; // ← NEW
+  final Future<void> Function(String, bool) onHandleRequest;
+  final Future<void> Function(String, String) onExpireRequest;
   final Future<void> Function(String, String) onUpdateStatus;
   final VoidCallback onAddRouteTap, onSetupTap;
 
@@ -1210,17 +1053,11 @@ class _HomeTab extends StatelessWidget {
     required this.user,
     required this.kycVerified,
     required this.locationGranted,
-    required this.fromFilter,
-    required this.toFilter,
-    required this.cities,
-    required this.availableStream,
     required this.incomingStream,
     required this.activeStream,
     required this.completedStream,
-    required this.onFromChanged,
-    required this.onToChanged,
-    required this.onAccept,
     required this.onHandleRequest,
+    required this.onExpireRequest,
     required this.onUpdateStatus,
     required this.onAddRouteTap,
     required this.onSetupTap,
@@ -1239,7 +1076,6 @@ class _HomeTab extends StatelessWidget {
   Widget build(BuildContext context) {
     return CustomScrollView(
       slivers: [
-        // ── Header ───────────────────────────────────────────────────────────
         SliverAppBar(
           expandedHeight: 162,
           floating: false,
@@ -1263,7 +1099,6 @@ class _HomeTab extends StatelessWidget {
                     children: [
                       Row(
                         children: [
-                          // Avatar with verified dot
                           Stack(
                             children: [
                               CircleAvatar(
@@ -1328,7 +1163,6 @@ class _HomeTab extends StatelessWidget {
                               ],
                             ),
                           ),
-                          // Badges
                           Column(
                             crossAxisAlignment: CrossAxisAlignment.end,
                             children: [
@@ -1350,7 +1184,6 @@ class _HomeTab extends StatelessWidget {
                         ],
                       ),
                       const SizedBox(height: 18),
-                      // Live earnings quick-stat
                       StreamBuilder<QuerySnapshot>(
                         stream: completedStream,
                         builder: (_, snap) {
@@ -1393,7 +1226,6 @@ class _HomeTab extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                // ── Setup gate banner ──────────────────────────────────────────
                 if (!_fullySetup) ...[
                   _SetupBanner(
                     locationGranted: locationGranted,
@@ -1402,16 +1234,12 @@ class _HomeTab extends StatelessWidget {
                   ),
                   const SizedBox(height: 16),
                 ],
-
-                // ── Add route card ─────────────────────────────────────────────
                 _AddRouteCard(onTap: onAddRouteTap),
                 const SizedBox(height: 22),
-
-                // ── Earnings summary ───────────────────────────────────────────
                 _EarningCard(stream: completedStream),
                 const SizedBox(height: 22),
 
-                // ── NEW SECTION: Incoming Requests ───────────────────────
+                // ── Incoming Requests ──────────────────────────────────────
                 _SectionTitle(icon: '📥', title: 'Incoming Requests'),
                 const SizedBox(height: 10),
                 StreamBuilder<QuerySnapshot>(
@@ -1438,7 +1266,10 @@ class _HomeTab extends StatelessWidget {
                         return _RequestCard(
                           data: data,
                           docId: doc.id,
+                          currentUserId:
+                              FirebaseAuth.instance.currentUser?.uid ?? '',
                           onHandle: onHandleRequest,
+                          onExpire: onExpireRequest,
                         );
                       }).toList(),
                     );
@@ -1446,77 +1277,12 @@ class _HomeTab extends StatelessWidget {
                 ),
                 const SizedBox(height: 22),
 
-                // ── Active deliveries ──────────────────────────────────────────
+                // ── Active Deliveries ──────────────────────────────────────
                 _SectionTitle(icon: '🚌', title: 'Active Deliveries'),
                 const SizedBox(height: 10),
                 _ActiveSection(
                   stream: activeStream,
                   onUpdateStatus: onUpdateStatus,
-                ),
-                const SizedBox(height: 22),
-
-                // ── Available parcels ──────────────────────────────────────────
-                _SectionTitle(icon: '📦', title: 'Available Parcels'),
-                const SizedBox(height: 4),
-                const Text(
-                  'Live requests posted by senders – accept to earn',
-                  style: TextStyle(fontSize: 12, color: _text2),
-                ),
-                const SizedBox(height: 12),
-
-                // Route filter
-                _FilterRow(
-                  fromFilter: fromFilter,
-                  toFilter: toFilter,
-                  cities: cities,
-                  onFromChanged: onFromChanged,
-                  onToChanged: onToChanged,
-                ),
-                const SizedBox(height: 12),
-
-                // Real-time parcel list
-                StreamBuilder<QuerySnapshot>(
-                  stream: availableStream,
-                  builder: (ctx, snap) {
-                    if (snap.connectionState == ConnectionState.waiting) {
-                      return const Center(
-                        child: Padding(
-                          padding: EdgeInsets.all(24),
-                          child: CircularProgressIndicator(color: _indigo),
-                        ),
-                      );
-                    }
-                    if (snap.hasError) {
-                      return _InfoCard(
-                        icon: '⚠️',
-                        text:
-                            'Could not load parcels.\n'
-                            'Check Firestore indexes.',
-                        color: _red,
-                      );
-                    }
-                    if (!snap.hasData || snap.data!.docs.isEmpty) {
-                      return _InfoCard(
-                        icon: '📭',
-                        text:
-                            'No parcels available on this route yet.\n'
-                            'Parcels appear here once a sender posts a request.',
-                        color: _text2,
-                      );
-                    }
-                    return Column(
-                      children: snap.data!.docs.map((doc) {
-                        final data = doc.data() as Map<String, dynamic>;
-                        return _ParcelCard(
-                          data: data,
-                          docId: doc.id,
-                          canAccept: kycVerified && locationGranted,
-                          onAccept: onAccept,
-                          onSetupTap: onSetupTap,
-                        );
-                      }).toList(),
-                    );
-                  },
                 ),
                 const SizedBox(height: 32),
               ],
@@ -1529,49 +1295,219 @@ class _HomeTab extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  NEW WIDGET: Request Card (Accept / Reject)
+//  REQUEST CARD  ←  THIS IS WHERE THE TIMER LIVES
+//
+//  On mount:
+//    • If already expired → calls onExpire immediately (Firestore write)
+//    • If not yet expired → starts a countdown Timer for the remaining window
+//
+//  The Timer fires EXACTLY when 15 minutes have elapsed since requestedAt.
+//  On fire → calls onExpire which:
+//      status = 'pending'
+//      travelerId = null
+//      travelerName = null
+//      ignoredTravelers = arrayUnion([travelerId])
+//
+//  A 1-second ticker keeps the UI countdown up-to-date until expiry.
+//  Both timers are cancelled in dispose() — no leaks.
 // ════════════════════════════════════════════════════════════════════════════
-class _RequestCard extends StatelessWidget {
+class _RequestCard extends StatefulWidget {
   final Map<String, dynamic> data;
   final String docId;
+  final String currentUserId;
   final Future<void> Function(String, bool) onHandle;
+  final Future<void> Function(String, String) onExpire;
 
   const _RequestCard({
     required this.data,
     required this.docId,
+    required this.currentUserId,
     required this.onHandle,
+    required this.onExpire,
   });
 
   @override
+  State<_RequestCard> createState() => _RequestCardState();
+}
+
+class _RequestCardState extends State<_RequestCard> {
+  // ── Timer state ────────────────────────────────────────────────────────────
+  Timer? _expiryTimer; // fires once at the exact expiry moment
+  Timer? _tickTimer; // fires every second to refresh the countdown label
+  Duration _remaining = Duration.zero;
+  bool _expired = false;
+  bool _handling = false;
+  bool _expiryCalled = false; // guard so we only call onExpire once
+
+  @override
+  void initState() {
+    super.initState();
+    _initTimer();
+  }
+
+  @override
+  void didUpdateWidget(_RequestCard oldWidget) {
+    super.didUpdateWidget(oldWidget);
+    // If the parcel document is updated (e.g. re-sent) restart the timer.
+    if (oldWidget.data['requestedAt'] != widget.data['requestedAt']) {
+      _cancelTimers();
+      _expiryCalled = false;
+      _expired = false;
+      _initTimer();
+    }
+  }
+
+  @override
+  void dispose() {
+    _cancelTimers();
+    super.dispose();
+  }
+
+  void _cancelTimers() {
+    _expiryTimer?.cancel();
+    _tickTimer?.cancel();
+    _expiryTimer = null;
+    _tickTimer = null;
+  }
+
+  /// Calculates how much time is left and arms the appropriate timers.
+  void _initTimer() {
+    final requestedAt = widget.data['requestedAt'] as Timestamp?;
+    if (requestedAt == null) {
+      // No timestamp → treat as expired immediately
+      setState(() {
+        _expired = true;
+        _remaining = Duration.zero;
+      });
+      _doExpire();
+      return;
+    }
+
+    final elapsed = DateTime.now().difference(requestedAt.toDate());
+
+    if (elapsed >= _kRequestExpiry) {
+      // Already past the window when the card was first built
+      setState(() {
+        _expired = true;
+        _remaining = Duration.zero;
+      });
+      _doExpire();
+      return;
+    }
+
+    // Still within the window — calculate precise remaining duration
+    final remaining = _kRequestExpiry - elapsed;
+    setState(() {
+      _remaining = remaining;
+      _expired = false;
+    });
+
+    // ── One-shot expiry timer ─────────────────────────────────────────────
+    _expiryTimer = Timer(remaining, () {
+      if (!mounted) return;
+      setState(() {
+        _expired = true;
+        _remaining = Duration.zero;
+      });
+      _doExpire();
+    });
+
+    // ── Countdown ticker: updates display every second ────────────────────
+    _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
+      if (!mounted) return;
+      final newElapsed = DateTime.now().difference(requestedAt.toDate());
+      final newRemaining = _kRequestExpiry - newElapsed;
+      if (newRemaining.isNegative || newRemaining == Duration.zero) {
+        _tickTimer?.cancel();
+        setState(() {
+          _remaining = Duration.zero;
+          _expired = true;
+        });
+      } else {
+        setState(() => _remaining = newRemaining);
+      }
+    });
+  }
+
+  /// Calls the parent's expiry callback exactly once, then writes to Firestore.
+  void _doExpire() {
+    if (_expiryCalled) return;
+    _expiryCalled = true;
+    final travelerId =
+        widget.data['travelerId'] as String? ?? widget.currentUserId;
+    widget.onExpire(widget.docId, travelerId);
+  }
+
+  Future<void> _handle(bool accept) async {
+    _cancelTimers(); // stop the timer before the async action
+    setState(() => _handling = true);
+    await widget.onHandle(widget.docId, accept);
+    if (mounted) setState(() => _handling = false);
+  }
+
+  /// Formats remaining duration as "14 min 32 sec" or "45 sec"
+  String get _countdownLabel {
+    final m = _remaining.inMinutes;
+    final s = _remaining.inSeconds % 60;
+    if (m > 0) return '$m min ${s.toString().padLeft(2, '0')} sec';
+    return '${s}s left';
+  }
+
+  /// Formats elapsed time as "Requested 3 minutes ago"
+  String _timeAgo(Timestamp? ts) {
+    if (ts == null) return 'Unknown time';
+    final diff = DateTime.now().difference(ts.toDate());
+    if (diff.inSeconds < 60) return 'Requested just now';
+    if (diff.inMinutes < 60) {
+      return 'Requested ${diff.inMinutes} min${diff.inMinutes == 1 ? '' : 's'} ago';
+    }
+    return 'Requested ${diff.inHours} hour${diff.inHours == 1 ? '' : 's'} ago';
+  }
+
+  // ── Countdown colour (green → orange → red as time runs out) ─────────────
+  Color get _countdownColor {
+    final fraction = _remaining.inSeconds / _kRequestExpiry.inSeconds;
+    if (fraction > 0.5) return _teal;
+    if (fraction > 0.25) return _orange;
+    return _red;
+  }
+
+  @override
   Widget build(BuildContext context) {
+    final requestedAt = widget.data['requestedAt'] as Timestamp?;
+
     return GestureDetector(
-      onTap: () {
-        // Navigate to traveler parcel details page
-        context.go('/traveler-parcel-details/$docId');
-      },
+      onTap: () => context.push('/traveler-parcel-details/${widget.docId}'),
       child: Container(
         margin: const EdgeInsets.only(bottom: 12),
-        padding: const EdgeInsets.all(14),
+        padding: const EdgeInsets.all(16),
         decoration: BoxDecoration(
-          color: _orange.withOpacity(0.04),
+          color: _expired ? _red.withOpacity(0.03) : _orange.withOpacity(0.04),
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: _orange.withOpacity(0.3)),
+          border: Border.all(
+            color: _expired ? _red.withOpacity(0.25) : _orange.withOpacity(0.3),
+          ),
         ),
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
+            // ── Route + category row ───────────────────────────────────────
             Row(
               children: [
                 Container(
                   width: 40,
                   height: 40,
                   decoration: BoxDecoration(
-                    color: _orange.withOpacity(0.1),
+                    color: _expired
+                        ? _red.withOpacity(0.1)
+                        : _orange.withOpacity(0.1),
                     borderRadius: BorderRadius.circular(10),
                   ),
-                  child: const Icon(
-                    Icons.pending_actions_rounded,
-                    color: _orange,
+                  child: Icon(
+                    _expired
+                        ? Icons.timer_off_outlined
+                        : Icons.pending_actions_rounded,
+                    color: _expired ? _red : _orange,
                     size: 22,
                   ),
                 ),
@@ -1581,7 +1517,7 @@ class _RequestCard extends StatelessWidget {
                     crossAxisAlignment: CrossAxisAlignment.start,
                     children: [
                       Text(
-                        '${data['fromCity']} → ${data['toCity']}',
+                        '${widget.data['fromCity']} → ${widget.data['toCity']}',
                         style: const TextStyle(
                           fontSize: 14,
                           fontWeight: FontWeight.bold,
@@ -1589,8 +1525,8 @@ class _RequestCard extends StatelessWidget {
                         ),
                       ),
                       Text(
-                        // Removed price – only category
-                        '${data['category'] ?? 'Parcel'}',
+                        '${widget.data['category'] ?? 'Parcel'}  •  '
+                        '₹${widget.data['price'] ?? 0}',
                         style: const TextStyle(fontSize: 12, color: _text2),
                       ),
                     ],
@@ -1598,34 +1534,169 @@ class _RequestCard extends StatelessWidget {
                 ),
               ],
             ),
+
+            // ── "Requested X min ago" ──────────────────────────────────────
+            if (requestedAt != null) ...[
+              const SizedBox(height: 6),
+              Row(
+                children: [
+                  Icon(
+                    Icons.access_time_rounded,
+                    size: 12,
+                    color: _expired ? _red : _text2,
+                  ),
+                  const SizedBox(width: 4),
+                  Text(
+                    _timeAgo(requestedAt),
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _expired ? _red : _text2,
+                      fontWeight: _expired
+                          ? FontWeight.w600
+                          : FontWeight.normal,
+                    ),
+                  ),
+                ],
+              ),
+            ],
+
+            // ── Live countdown bar (hidden once expired) ───────────────────
+            if (!_expired && _remaining.inSeconds > 0) ...[
+              const SizedBox(height: 10),
+              Row(
+                children: [
+                  Icon(
+                    Icons.hourglass_top_rounded,
+                    size: 13,
+                    color: _countdownColor,
+                  ),
+                  const SizedBox(width: 5),
+                  Text(
+                    _countdownLabel,
+                    style: TextStyle(
+                      fontSize: 12,
+                      fontWeight: FontWeight.w700,
+                      color: _countdownColor,
+                    ),
+                  ),
+                  const Spacer(),
+                  Text(
+                    'to respond',
+                    style: TextStyle(
+                      fontSize: 11,
+                      color: _countdownColor.withOpacity(0.7),
+                    ),
+                  ),
+                ],
+              ),
+              const SizedBox(height: 5),
+              ClipRRect(
+                borderRadius: BorderRadius.circular(4),
+                child: LinearProgressIndicator(
+                  value: (_remaining.inSeconds / _kRequestExpiry.inSeconds)
+                      .clamp(0.0, 1.0),
+                  minHeight: 4,
+                  backgroundColor: _countdownColor.withOpacity(0.15),
+                  valueColor: AlwaysStoppedAnimation<Color>(_countdownColor),
+                ),
+              ),
+            ],
+
+            // ── Expired warning banner ─────────────────────────────────────
+            if (_expired) ...[
+              const SizedBox(height: 10),
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 8,
+                ),
+                decoration: BoxDecoration(
+                  color: _red.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(10),
+                  border: Border.all(color: _red.withOpacity(0.25)),
+                ),
+                child: const Row(
+                  children: [
+                    Icon(Icons.warning_amber_rounded, size: 14, color: _red),
+                    SizedBox(width: 6),
+                    Text(
+                      'This request has expired.',
+                      style: TextStyle(
+                        fontSize: 12,
+                        color: _red,
+                        fontWeight: FontWeight.w600,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ],
+
             const SizedBox(height: 12),
+
+            // ── Reject / Accept buttons ────────────────────────────────────
             Row(
               children: [
                 Expanded(
-                  child: OutlinedButton(
-                    onPressed: () => onHandle(docId, false),
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: _red,
-                      side: BorderSide(color: _red.withOpacity(0.5)),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10),
+                  child: SizedBox(
+                    height: 40,
+                    child: OutlinedButton.icon(
+                      onPressed: _handling ? null : () => _handle(false),
+                      icon: const Icon(Icons.close_rounded, size: 16),
+                      label: const Text(
+                        'Reject',
+                        style: TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      style: OutlinedButton.styleFrom(
+                        foregroundColor: _red,
+                        side: BorderSide(color: _red.withOpacity(0.5)),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
                       ),
                     ),
-                    child: const Text('Reject'),
                   ),
                 ),
                 const SizedBox(width: 10),
                 Expanded(
-                  child: ElevatedButton(
-                    onPressed: () => onHandle(docId, true),
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: _green,
-                      foregroundColor: Colors.white,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10),
+                  child: SizedBox(
+                    height: 40,
+                    child: ElevatedButton.icon(
+                      // Disabled if expired OR already handling
+                      onPressed: (_handling || _expired)
+                          ? null
+                          : () => _handle(true),
+                      icon: _handling
+                          ? const SizedBox(
+                              width: 14,
+                              height: 14,
+                              child: CircularProgressIndicator(
+                                color: Colors.white,
+                                strokeWidth: 2,
+                              ),
+                            )
+                          : const Icon(Icons.check_rounded, size: 16),
+                      label: Text(
+                        _expired ? 'Expired' : 'Accept',
+                        style: const TextStyle(
+                          fontSize: 13,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                      style: ElevatedButton.styleFrom(
+                        backgroundColor: _expired ? _text2 : _green,
+                        foregroundColor: Colors.white,
+                        disabledBackgroundColor: _text2.withOpacity(0.4),
+                        shape: RoundedRectangleBorder(
+                          borderRadius: BorderRadius.circular(10),
+                        ),
+                        elevation: 0,
                       ),
                     ),
-                    child: const Text('Accept'),
                   ),
                 ),
               ],
@@ -1638,7 +1709,7 @@ class _RequestCard extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  DELIVERIES TAB
+//  DELIVERIES TAB (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _DeliveriesTab extends StatelessWidget {
   final Stream<QuerySnapshot> stream;
@@ -1681,7 +1752,7 @@ class _DeliveriesTab extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  WALLET TAB
+//  WALLET TAB (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _WalletTab extends StatelessWidget {
   final Stream<QuerySnapshot> completedStream;
@@ -1708,7 +1779,6 @@ class _WalletTab extends StatelessWidget {
         return ListView(
           padding: const EdgeInsets.all(16),
           children: [
-            // Balance card
             Container(
               padding: const EdgeInsets.all(24),
               decoration: BoxDecoration(
@@ -1861,7 +1931,7 @@ class _WalletTab extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  ROUTES TAB (NEW)
+//  ROUTES TAB (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _RoutesTab extends StatelessWidget {
   final Stream<QuerySnapshot> stream;
@@ -1869,14 +1939,15 @@ class _RoutesTab extends StatelessWidget {
 
   String _formatDateTime(Timestamp? ts) {
     if (ts == null) return 'Not set';
-    final dt = ts.toDate();
-    return DateFormat('dd MMM yyyy · hh:mm a').format(dt);
+    return DateFormat('dd MMM yyyy · hh:mm a').format(ts.toDate());
   }
 
-  bool _isActive(Timestamp? ts) {
+  bool _isActive(Map<String, dynamic> data) {
+    final storedStatus = data['status'] as String?;
+    if (storedStatus != null) return storedStatus == 'active';
+    final ts = data['travelDateTime'] as Timestamp?;
     if (ts == null) return false;
-    return ts.toDate().isAfter(DateTime.now()) ||
-        ts.toDate().isAtSameMomentAs(DateTime.now());
+    return ts.toDate().isAfter(DateTime.now());
   }
 
   @override
@@ -1914,8 +1985,7 @@ class _RoutesTab extends StatelessWidget {
               final doc = snap.data!.docs[i];
               final data = doc.data() as Map<String, dynamic>;
               final travelTs = data['travelDateTime'] as Timestamp?;
-              final active = _isActive(travelTs);
-
+              final active = _isActive(data);
               return Container(
                 margin: const EdgeInsets.only(bottom: 12),
                 padding: const EdgeInsets.all(16),
@@ -2023,7 +2093,7 @@ class _RoutesTab extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PROFILE TAB
+//  PROFILE TAB (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _ProfileTab extends StatelessWidget {
   final User? user;
@@ -2045,7 +2115,6 @@ class _ProfileTab extends StatelessWidget {
     body: ListView(
       padding: const EdgeInsets.all(16),
       children: [
-        // Avatar card
         Container(
           padding: const EdgeInsets.all(20),
           decoration: BoxDecoration(
@@ -2110,8 +2179,6 @@ class _ProfileTab extends StatelessWidget {
           ),
         ),
         const SizedBox(height: 16),
-
-        // Checklist
         Container(
           padding: const EdgeInsets.all(14),
           decoration: BoxDecoration(
@@ -2161,17 +2228,13 @@ class _ProfileTab extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  REUSABLE WIDGETS
+//  REUSABLE WIDGETS (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
-
-// ── App bar ──────────────────────────────────────────────────────────────────
 class _Appbar extends StatelessWidget implements PreferredSizeWidget {
   final String title;
   const _Appbar({required this.title});
-
   @override
   Size get preferredSize => const Size.fromHeight(kToolbarHeight);
-
   @override
   Widget build(BuildContext context) => AppBar(
     backgroundColor: _indigo,
@@ -2188,12 +2251,10 @@ class _Appbar extends StatelessWidget implements PreferredSizeWidget {
   );
 }
 
-// ── Bottom navigation ─────────────────────────────────────────────────────────
 class _BottomNav extends StatelessWidget {
   final int index;
   final void Function(int) onTap;
   const _BottomNav({required this.index, required this.onTap});
-
   @override
   Widget build(BuildContext context) => Container(
     decoration: BoxDecoration(
@@ -2217,7 +2278,6 @@ class _BottomNav extends StatelessWidget {
       selectedFontSize: 11,
       unselectedFontSize: 11,
       selectedLabelStyle: const TextStyle(fontWeight: FontWeight.w600),
-
       items: const [
         BottomNavigationBarItem(
           icon: Icon(Icons.home_outlined),
@@ -2235,7 +2295,7 @@ class _BottomNav extends StatelessWidget {
           label: 'Wallet',
         ),
         BottomNavigationBarItem(
-          icon: Icon(Icons.route_outlined), // NEW
+          icon: Icon(Icons.route_outlined),
           activeIcon: Icon(Icons.route_rounded),
           label: 'Routes',
         ),
@@ -2249,7 +2309,39 @@ class _BottomNav extends StatelessWidget {
   );
 }
 
-// ── Setup gate banner ─────────────────────────────────────────────────────────
+class _PickerField extends StatelessWidget {
+  final IconData icon;
+  final String text;
+  final bool hasValue;
+  const _PickerField({
+    required this.icon,
+    required this.text,
+    required this.hasValue,
+  });
+  @override
+  Widget build(BuildContext context) => Container(
+    padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 15),
+    decoration: BoxDecoration(
+      color: const Color(0xFFF8FAFF),
+      borderRadius: BorderRadius.circular(12),
+      border: Border.all(color: const Color(0xFFE2E8F0)),
+    ),
+    child: Row(
+      children: [
+        Icon(icon, size: 18, color: _text2),
+        const SizedBox(width: 12),
+        Expanded(
+          child: Text(
+            text,
+            style: TextStyle(fontSize: 14, color: hasValue ? _text1 : _text2),
+          ),
+        ),
+        const Icon(Icons.keyboard_arrow_down_rounded, size: 18, color: _text2),
+      ],
+    ),
+  );
+}
+
 class _SetupBanner extends StatelessWidget {
   final bool locationGranted, kycVerified;
   final VoidCallback onTap;
@@ -2258,7 +2350,6 @@ class _SetupBanner extends StatelessWidget {
     required this.kycVerified,
     required this.onTap,
   });
-
   @override
   Widget build(BuildContext context) {
     final steps = [
@@ -2324,11 +2415,9 @@ class _SetupBanner extends StatelessWidget {
   }
 }
 
-// ── Add route card ────────────────────────────────────────────────────────────
 class _AddRouteCard extends StatelessWidget {
   final VoidCallback onTap;
   const _AddRouteCard({required this.onTap});
-
   @override
   Widget build(BuildContext context) => GestureDetector(
     onTap: onTap,
@@ -2404,11 +2493,9 @@ class _AddRouteCard extends StatelessWidget {
   );
 }
 
-// ── Earnings card ─────────────────────────────────────────────────────────────
 class _EarningCard extends StatelessWidget {
   final Stream<QuerySnapshot> stream;
   const _EarningCard({required this.stream});
-
   @override
   Widget build(BuildContext context) => StreamBuilder<QuerySnapshot>(
     stream: stream,
@@ -2514,7 +2601,6 @@ class _ETile extends StatelessWidget {
     required this.icon,
     required this.color,
   });
-
   @override
   Widget build(BuildContext context) => Column(
     children: [
@@ -2538,12 +2624,10 @@ class _ETile extends StatelessWidget {
   );
 }
 
-// ── Active deliveries section ─────────────────────────────────────────────────
 class _ActiveSection extends StatelessWidget {
   final Stream<QuerySnapshot> stream;
   final Future<void> Function(String, String) onUpdateStatus;
   const _ActiveSection({required this.stream, required this.onUpdateStatus});
-
   @override
   Widget build(BuildContext context) => StreamBuilder<QuerySnapshot>(
     stream: stream,
@@ -2579,7 +2663,6 @@ class _ActiveTile extends StatelessWidget {
   final Map<String, dynamic> data;
   final String docId;
   final Future<void> Function(String, String) onUpdateStatus;
-
   const _ActiveTile({
     required this.data,
     required this.docId,
@@ -2587,22 +2670,17 @@ class _ActiveTile extends StatelessWidget {
   });
 
   Color get _sc => data['status'] == 'accepted' ? _indigo : _orange;
-
   String get _nextStatus =>
       data['status'] == 'accepted' ? 'picked' : 'delivered';
-
   String get _nextLabel =>
       data['status'] == 'accepted' ? 'Mark Picked' : 'Mark Delivered';
 
   @override
   Widget build(BuildContext context) {
     final double price = (data['price'] ?? 0).toDouble();
-    final double travelerEarn = price * 0.70; // 30% commission cut
-
+    final double travelerEarn = price * 0.70;
     return InkWell(
-      onTap: () {
-        context.push('/traveler-parcel-details/$docId');
-      },
+      onTap: () => context.push('/traveler-parcel-details/$docId'),
       borderRadius: BorderRadius.circular(16),
       child: Container(
         margin: const EdgeInsets.only(bottom: 10),
@@ -2610,10 +2688,10 @@ class _ActiveTile extends StatelessWidget {
         decoration: BoxDecoration(
           color: _card,
           borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: _sc.withValues(alpha: 0.25)),
+          border: Border.all(color: _sc.withOpacity(0.25)),
           boxShadow: [
             BoxShadow(
-              color: _sc.withValues(alpha: 0.06),
+              color: _sc.withOpacity(0.06),
               blurRadius: 8,
               offset: const Offset(0, 2),
             ),
@@ -2621,12 +2699,11 @@ class _ActiveTile extends StatelessWidget {
         ),
         child: Row(
           children: [
-            // ── Icon ──
             Container(
               width: 42,
               height: 42,
               decoration: BoxDecoration(
-                color: _sc.withValues(alpha: 0.1),
+                color: _sc.withOpacity(0.1),
                 borderRadius: BorderRadius.circular(12),
               ),
               child: Icon(
@@ -2637,10 +2714,7 @@ class _ActiveTile extends StatelessWidget {
                 size: 20,
               ),
             ),
-
             const SizedBox(width: 12),
-
-            // ── Route + Earnings ──
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
@@ -2673,9 +2747,7 @@ class _ActiveTile extends StatelessWidget {
                       ),
                     ],
                   ),
-
                   const SizedBox(height: 2),
-
                   Text(
                     'Earn ₹${travelerEarn.toStringAsFixed(0)}  •  '
                     '${(data['status'] ?? '').toString().toUpperCase()}',
@@ -2685,13 +2757,9 @@ class _ActiveTile extends StatelessWidget {
                       fontWeight: FontWeight.w600,
                     ),
                   ),
-
-                  const SizedBox(height: 2),
                 ],
               ),
             ),
-
-            // ── Status Button ──
             TextButton(
               onPressed: () => onUpdateStatus(docId, _nextStatus),
               style: TextButton.styleFrom(
@@ -2702,7 +2770,7 @@ class _ActiveTile extends StatelessWidget {
                 ),
                 shape: RoundedRectangleBorder(
                   borderRadius: BorderRadius.circular(10),
-                  side: BorderSide(color: _sc.withValues(alpha: 0.4)),
+                  side: BorderSide(color: _sc.withOpacity(0.4)),
                 ),
               ),
               child: Text(
@@ -2720,322 +2788,7 @@ class _ActiveTile extends StatelessWidget {
   }
 }
 
-// ── Available parcel card ─────────────────────────────────────────────────────
-class _ParcelCard extends StatefulWidget {
-  final Map<String, dynamic> data;
-  final String docId;
-  final bool canAccept;
-  final Future<void> Function(String) onAccept;
-  final VoidCallback onSetupTap;
-  const _ParcelCard({
-    required this.data,
-    required this.docId,
-    required this.canAccept,
-    required this.onAccept,
-    required this.onSetupTap,
-  });
-
-  @override
-  State<_ParcelCard> createState() => _ParcelCardState();
-}
-
-class _ParcelCardState extends State<_ParcelCard> {
-  bool _accepting = false;
-
-  @override
-  Widget build(BuildContext context) {
-    final d = widget.data;
-    return Container(
-      margin: const EdgeInsets.only(bottom: 12),
-      decoration: BoxDecoration(
-        color: _card,
-        borderRadius: BorderRadius.circular(18),
-        border: Border.all(color: const Color(0xFFE2E8F0)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.04),
-            blurRadius: 10,
-            offset: const Offset(0, 3),
-          ),
-        ],
-      ),
-      child: Column(
-        children: [
-          Padding(
-            padding: const EdgeInsets.all(14),
-            child: Row(
-              children: [
-                Container(
-                  width: 48,
-                  height: 48,
-                  decoration: BoxDecoration(
-                    color: _indigo.withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(13),
-                  ),
-                  child: const Icon(
-                    Icons.inventory_2_outlined,
-                    color: _indigo,
-                    size: 22,
-                  ),
-                ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Row(
-                        children: [
-                          Text(
-                            d['fromCity'] ?? '',
-                            style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.bold,
-                              color: _text1,
-                            ),
-                          ),
-                          const Padding(
-                            padding: EdgeInsets.symmetric(horizontal: 5),
-                            child: Icon(
-                              Icons.arrow_forward_rounded,
-                              size: 13,
-                              color: _teal,
-                            ),
-                          ),
-                          Text(
-                            d['toCity'] ?? '',
-                            style: const TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.bold,
-                              color: _text1,
-                            ),
-                          ),
-                        ],
-                      ),
-                      const SizedBox(height: 3),
-                      Row(
-                        children: [
-                          if (d['category'] != null) ...[
-                            Container(
-                              padding: const EdgeInsets.symmetric(
-                                horizontal: 7,
-                                vertical: 2,
-                              ),
-                              decoration: BoxDecoration(
-                                color: _indigo.withOpacity(0.07),
-                                borderRadius: BorderRadius.circular(6),
-                              ),
-                              child: Text(
-                                d['category'] as String,
-                                style: const TextStyle(
-                                  fontSize: 10,
-                                  color: _indigo,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                            ),
-                            const SizedBox(width: 6),
-                          ],
-                          Flexible(
-                            child: Text(
-                              d['description'] ?? 'Parcel',
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: _text2,
-                              ),
-                              maxLines: 1,
-                              overflow: TextOverflow.ellipsis,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ],
-                  ),
-                ),
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 7,
-                  ),
-                  decoration: BoxDecoration(
-                    color: _green.withOpacity(0.08),
-                    borderRadius: BorderRadius.circular(12),
-                    border: Border.all(color: _green.withOpacity(0.2)),
-                  ),
-                  child: Column(
-                    children: [
-                      const Text(
-                        'Earn',
-                        style: TextStyle(fontSize: 9, color: _text2),
-                      ),
-                      Text(
-                        '₹${d['price'] ?? 0}',
-                        style: const TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          color: _green,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-              ],
-            ),
-          ),
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
-            decoration: const BoxDecoration(
-              color: Color(0xFFF8FAFF),
-              borderRadius: BorderRadius.vertical(bottom: Radius.circular(18)),
-            ),
-            child: Row(
-              children: [
-                _Chip(
-                  icon: Icons.scale_outlined,
-                  label: '${d['weight'] ?? 0} kg',
-                ),
-                const SizedBox(width: 8),
-                _Chip(
-                  icon: Icons.person_outline,
-                  label: d['senderName'] ?? 'Sender',
-                ),
-                if (d['size'] != null) ...[
-                  const SizedBox(width: 8),
-                  _Chip(
-                    icon: Icons.straighten_outlined,
-                    label: d['size'] as String,
-                  ),
-                ],
-                const Spacer(),
-                SizedBox(
-                  height: 34,
-                  child: ElevatedButton(
-                    onPressed: _accepting
-                        ? null
-                        : () async {
-                            if (!widget.canAccept) {
-                              widget.onSetupTap();
-                              return;
-                            }
-                            setState(() => _accepting = true);
-                            await widget.onAccept(widget.docId);
-                            if (mounted) setState(() => _accepting = false);
-                          },
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: widget.canAccept ? _indigo : _orange,
-                      foregroundColor: Colors.white,
-                      padding: const EdgeInsets.symmetric(horizontal: 14),
-                      minimumSize: Size.zero,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(10),
-                      ),
-                      elevation: 0,
-                    ),
-                    child: _accepting
-                        ? const SizedBox(
-                            width: 14,
-                            height: 14,
-                            child: CircularProgressIndicator(
-                              color: Colors.white,
-                              strokeWidth: 2,
-                            ),
-                          )
-                        : Text(
-                            widget.canAccept ? 'Accept' : 'Setup First',
-                            style: const TextStyle(
-                              fontSize: 12,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                  ),
-                ),
-              ],
-            ),
-          ),
-        ],
-      ),
-    );
-  }
-}
-
-// ── Route filter row ──────────────────────────────────────────────────────────
-class _FilterRow extends StatelessWidget {
-  final String fromFilter, toFilter;
-  final List<String> cities;
-  final void Function(String) onFromChanged, onToChanged;
-  const _FilterRow({
-    required this.fromFilter,
-    required this.toFilter,
-    required this.cities,
-    required this.onFromChanged,
-    required this.onToChanged,
-  });
-
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 8),
-    decoration: BoxDecoration(
-      color: _card,
-      borderRadius: BorderRadius.circular(14),
-      border: Border.all(color: const Color(0xFFE2E8F0)),
-    ),
-    child: Row(
-      children: [
-        const Icon(Icons.filter_list_rounded, size: 16, color: _text2),
-        const SizedBox(width: 8),
-        Expanded(
-          child: _MDrop(
-            value: fromFilter,
-            items: cities,
-            onChanged: onFromChanged,
-          ),
-        ),
-        const Padding(
-          padding: EdgeInsets.symmetric(horizontal: 6),
-          child: Icon(Icons.arrow_forward_rounded, size: 14, color: _teal),
-        ),
-        Expanded(
-          child: _MDrop(value: toFilter, items: cities, onChanged: onToChanged),
-        ),
-      ],
-    ),
-  );
-}
-
-class _MDrop extends StatelessWidget {
-  final String value;
-  final List<String> items;
-  final void Function(String) onChanged;
-  const _MDrop({
-    required this.value,
-    required this.items,
-    required this.onChanged,
-  });
-
-  @override
-  Widget build(BuildContext context) => DropdownButtonHideUnderline(
-    child: DropdownButton<String>(
-      value: value,
-      isExpanded: true,
-      isDense: true,
-      style: const TextStyle(
-        fontSize: 13,
-        color: _text1,
-        fontWeight: FontWeight.w500,
-      ),
-      icon: const Icon(
-        Icons.keyboard_arrow_down_rounded,
-        size: 16,
-        color: _text2,
-      ),
-      items: items
-          .map((c) => DropdownMenuItem(value: c, child: Text(c)))
-          .toList(),
-      onChanged: (v) => onChanged(v!),
-    ),
-  );
-}
-
-// ── Step tile (for setup sheet) ────────────────────────────────────────────────
+// ── Small reusable widgets ────────────────────────────────────────────────────
 class _StepTile extends StatelessWidget {
   final String stepNum, title, subtitle, buttonLabel;
   final IconData icon;
@@ -3052,7 +2805,6 @@ class _StepTile extends StatelessWidget {
     required this.buttonLabel,
     this.onTap,
   });
-
   @override
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.all(14),
@@ -3121,7 +2873,6 @@ class _StepTile extends StatelessWidget {
   );
 }
 
-// ── Misc tiny widgets ─────────────────────────────────────────────────────────
 class _Handle extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Container(
@@ -3138,7 +2889,6 @@ class _StepCircle extends StatelessWidget {
   final String num;
   final bool done;
   const _StepCircle({required this.num, required this.done});
-
   @override
   Widget build(BuildContext context) => Container(
     width: 24,
@@ -3166,7 +2916,6 @@ class _HBadge extends StatelessWidget {
   final String label;
   final Color bg;
   const _HBadge({required this.label, required this.bg});
-
   @override
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
@@ -3188,7 +2937,6 @@ class _HBadge extends StatelessWidget {
 class _QStat extends StatelessWidget {
   final String label, value;
   const _QStat({required this.label, required this.value});
-
   @override
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
@@ -3209,7 +2957,6 @@ class _QStat extends StatelessWidget {
 class _SectionTitle extends StatelessWidget {
   final String icon, title;
   const _SectionTitle({required this.icon, required this.title});
-
   @override
   Widget build(BuildContext context) => Row(
     children: [
@@ -3235,7 +2982,6 @@ class _InfoCard extends StatelessWidget {
     required this.text,
     required this.color,
   });
-
   @override
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.all(18),
@@ -3262,7 +3008,6 @@ class _InfoCard extends StatelessWidget {
 class _Empty extends StatelessWidget {
   final String emoji, label, sub;
   const _Empty({required this.emoji, required this.label, required this.sub});
-
   @override
   Widget build(BuildContext context) => Center(
     child: Padding(
@@ -3292,26 +3037,10 @@ class _Empty extends StatelessWidget {
   );
 }
 
-class _Chip extends StatelessWidget {
-  final IconData icon;
-  final String label;
-  const _Chip({required this.icon, required this.label});
-
-  @override
-  Widget build(BuildContext context) => Row(
-    children: [
-      Icon(icon, size: 12, color: _text2),
-      const SizedBox(width: 3),
-      Text(label, style: const TextStyle(fontSize: 11, color: _text2)),
-    ],
-  );
-}
-
 class _PBadge extends StatelessWidget {
   final String label;
   final Color color;
   const _PBadge({required this.label, required this.color});
-
   @override
   Widget build(BuildContext context) => Container(
     padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 3),
@@ -3335,7 +3064,6 @@ class _CheckRow extends StatelessWidget {
     required this.done,
     required this.onTap,
   });
-
   @override
   Widget build(BuildContext context) => ListTile(
     dense: true,
@@ -3384,7 +3112,6 @@ class _MenuTile extends StatelessWidget {
     required this.onTap,
     this.textColor,
   });
-
   @override
   Widget build(BuildContext context) => Container(
     margin: const EdgeInsets.only(bottom: 10),
@@ -3424,7 +3151,6 @@ class _MenuTile extends StatelessWidget {
 class _WStat extends StatelessWidget {
   final String label, value;
   const _WStat({required this.label, required this.value});
-
   @override
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
@@ -3442,7 +3168,6 @@ class _WStat extends StatelessWidget {
   );
 }
 
-// ── Sheet helpers ─────────────────────────────────────────────────────────────
 class _SourceCard extends StatelessWidget {
   final IconData icon;
   final String label;
@@ -3452,7 +3177,6 @@ class _SourceCard extends StatelessWidget {
     required this.label,
     required this.onTap,
   });
-
   @override
   Widget build(BuildContext context) => GestureDetector(
     onTap: onTap,
@@ -3485,7 +3209,6 @@ class _PrimaryBtn extends StatelessWidget {
   final String label;
   final VoidCallback onTap;
   const _PrimaryBtn({required this.label, required this.onTap});
-
   @override
   Widget build(BuildContext context) => SizedBox(
     width: double.infinity,
@@ -3516,7 +3239,6 @@ class _SheetDropdown extends StatelessWidget {
     required this.items,
     required this.onChanged,
   });
-
   @override
   Widget build(BuildContext context) => Column(
     crossAxisAlignment: CrossAxisAlignment.start,
@@ -3573,7 +3295,6 @@ class _SheetField extends StatelessWidget {
     required this.icon,
     this.keyboardType,
   });
-
   @override
   Widget build(BuildContext context) => TextField(
     controller: ctrl,

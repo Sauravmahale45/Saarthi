@@ -81,18 +81,25 @@ class _LoginSignupScreenState extends State<LoginSignupScreen>
   Future<void> _navigateAfterAuth() async {
     final uid = FirebaseAuth.instance.currentUser?.uid;
     if (uid == null) return;
+
     final doc = await FirebaseFirestore.instance
         .collection('users')
         .doc(uid)
         .get();
+
     final role = doc.data()?['role'] as String?;
+
     if (!mounted) return;
-    if (role == 'sender')
+
+    if (role == 'admin') {
+      context.go('/admin_home');
+    } else if (role == 'sender') {
       context.go('/sender');
-    else if (role == 'traveler')
+    } else if (role == 'traveler') {
       context.go('/traveler');
-    else
+    } else {
       context.go('/role');
+    }
   }
 
   // ── Email Login ────────────────────────────────────────────────────────────
