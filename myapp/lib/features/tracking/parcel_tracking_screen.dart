@@ -1,5 +1,5 @@
 // lib/features/tracking/parcel_tracking_screen.dart
-// Corrected version with better map visuals and reliable fallback
+// Corrected version with reliable polyline, distance/ETA, and no rebuild loops
 
 import 'dart:async';
 import 'dart:convert';
@@ -45,8 +45,12 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
     with SingleTickerProviderStateMixin {
   final MapController _mapController = MapController();
 
+  // Firestore subscription (replaces StreamBuilder)
+  StreamSubscription<DocumentSnapshot>? _locationSubscription;
+
+  // State variables
   LatLng? _travelerPos;
-  double? _travelerHeading; // new: for marker rotation
+  double? _travelerHeading;
   List<LatLng> _routePoints = [];
   double _distanceKm = 0;
   double _speedKmh = 0;
@@ -54,6 +58,9 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
   bool _fetchingRoute = false;
   bool _routeError = false;
   String _statusText = 'Locating traveler…';
+
+  // For change detection – store last processed position
+  LatLng? _lastProcessedPos;
 
   Timer? _routeDebounce;
   late AnimationController _pulseCtrl;
@@ -72,35 +79,66 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
       begin: 0.85,
       end: 1.15,
     ).animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
+
+    // Set up Firestore listener
+    _locationSubscription = FirebaseFirestore.instance
+        .collection('locations')
+        .doc(widget.parcelId)
+        .snapshots()
+        .listen(
+          (snapshot) {
+            if (snapshot.exists && snapshot.data() != null) {
+              _onLocationUpdate(snapshot.data()! as Map<String, dynamic>);
+            }
+          },
+          onError: (error) {
+            debugPrint('Location stream error: $error');
+          },
+        );
   }
 
   @override
   void dispose() {
     _pulseCtrl.dispose();
     _routeDebounce?.cancel();
+    _locationSubscription?.cancel(); // Clean up subscription
     super.dispose();
   }
 
+  /// Called whenever a new location document arrives.
+  /// Only proceeds if the coordinates have actually changed.
   void _onLocationUpdate(Map<String, dynamic> data) {
     final lat = (data['latitude'] as num?)?.toDouble();
     final lng = (data['longitude'] as num?)?.toDouble();
     final speed = (data['speed'] as num?)?.toDouble() ?? 0;
-    final heading = (data['heading'] as num?)?.toDouble(); // optional
+    final heading = (data['heading'] as num?)?.toDouble();
 
     if (lat == null || lng == null) return;
 
     final newPos = LatLng(lat, lng);
 
+    // Ignore if coordinates are essentially the same (epsilon ~11m)
+    if (_lastProcessedPos != null) {
+      const epsilon = 0.0001;
+      if ((newPos.latitude - _lastProcessedPos!.latitude).abs() < epsilon &&
+          (newPos.longitude - _lastProcessedPos!.longitude).abs() < epsilon) {
+        return;
+      }
+    }
+
+    // Update state with new data
     setState(() {
       _travelerPos = newPos;
       _travelerHeading = heading;
       _speedKmh = speed * 3.6;
       _statusText = 'Parcel is on the way';
+      _lastProcessedPos = newPos;
     });
 
-    // Smoothly animate camera to new position
+    // Move map camera to new position (using move, not animate)
     _mapController.move(newPos, _mapController.camera.zoom);
 
+    // Debounce route fetch: wait 1.5s after last movement
     _routeDebounce?.cancel();
     _routeDebounce = Timer(const Duration(milliseconds: 1500), () {
       _fetchRoute(newPos);
@@ -109,13 +147,14 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
 
   Future<void> _fetchRoute(LatLng from) async {
     if (_fetchingRoute) return;
+
     setState(() {
       _fetchingRoute = true;
       _routeError = false;
     });
 
     try {
-      // OSRM public server – replace with your own if needed
+      // OSRM public server
       final url = Uri.parse(
         'https://router.project-osrm.org/route/v1/driving/'
         '${from.longitude},${from.latitude};'
@@ -157,7 +196,7 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
       debugPrint('Route fetch failed: $e – using straight line fallback');
       // Fallback: straight line between traveler and destination
       setState(() {
-        _routePoints = [from, _dest];
+        _routePoints = [from, _dest]; // ensures at least two points
         _routeError = true;
         _fetchingRoute = false;
         _distanceKm = _haversineKm(from, _dest);
@@ -184,47 +223,23 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
 
   @override
   Widget build(BuildContext context) {
+    // No StreamBuilder – just use current state
     return Scaffold(
       backgroundColor: _bg,
-      body: StreamBuilder<DocumentSnapshot>(
-        stream: FirebaseFirestore.instance
-            .collection('locations')
-            .doc(widget.parcelId)
-            .snapshots(),
-        builder: (context, snap) {
-          if (snap.hasData && snap.data!.exists && snap.data!.data() != null) {
-            WidgetsBinding.instance.addPostFrameCallback((_) {
-              if (mounted) {
-                _onLocationUpdate(snap.data!.data()! as Map<String, dynamic>);
-              }
-            });
-          }
-
-          return Stack(
-            children: [
-              _buildMap(),
-              _buildTopBar(context),
-              Positioned(
-                top: 110,
-                left: 0,
-                right: 0,
-                child: Center(child: _buildStatusChip()),
-              ),
-              Positioned(
-                left: 0,
-                right: 0,
-                bottom: 0,
-                child: _buildBottomCard(),
-              ),
-              if (_fetchingRoute && _travelerPos != null)
-                Positioned(
-                  top: 150,
-                  right: 20,
-                  child: _buildRouteLoadingPill(),
-                ),
-            ],
-          );
-        },
+      body: Stack(
+        children: [
+          _buildMap(),
+          _buildTopBar(context),
+          Positioned(
+            top: 110,
+            left: 0,
+            right: 0,
+            child: Center(child: _buildStatusChip()),
+          ),
+          Positioned(left: 0, right: 0, bottom: 0, child: _buildBottomCard()),
+          if (_fetchingRoute && _travelerPos != null)
+            Positioned(top: 150, right: 20, child: _buildRouteLoadingPill()),
+        ],
       ),
     );
   }
@@ -244,7 +259,7 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
         ),
       ),
       children: [
-        // 🔥 Improved map style: CartoDB Voyager (free, clean)
+        // CartoDB Voyager tiles (free, clean)
         TileLayer(
           urlTemplate:
               'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
@@ -287,7 +302,7 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
                     scale: _pulse.value,
                     name: widget.travelerName,
                     speedKmh: _speedKmh,
-                    heading: _travelerHeading, // pass heading for rotation
+                    heading: _travelerHeading,
                   ),
                 ),
               ),
@@ -627,13 +642,13 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  TRAVELER MARKER (now with rotation)
+//  TRAVELER MARKER (with rotation)
 // ════════════════════════════════════════════════════════════════════════════
 class _TravelerMarker extends StatelessWidget {
   final double scale;
   final String name;
   final double speedKmh;
-  final double? heading; // new: direction in degrees
+  final double? heading;
 
   const _TravelerMarker({
     required this.scale,
