@@ -5,11 +5,13 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 // ── Screen Imports ─────────────────────────────────────────────────────────────
 import 'features/auth/screens/splash_screen.dart';
 import 'features/auth/screens/login_signup_screen.dart';
+import 'features/auth/screens/profile_setup_screen.dart';
 import 'features/auth/screens/role_selection_screen.dart';
 import 'features/sender/screens/sender_home_screen.dart';
 import 'features/traveler/screens/traveler_home_screen.dart';
 import 'features/traveler/screens/parcel_details_traveler.dart';
 import 'features/sender/screens/create_parcel_screen.dart';
+import 'features/sender/screens/sender_parcels_screen.dart';
 
 import 'features/sender/screens/available_travelers_screen.dart';
 import 'features/sender/screens/parcel_details.dart';
@@ -45,14 +47,15 @@ final routerProvider = Provider<GoRouter>((ref) {
         pageBuilder: (context, state) =>
             _slidePage(key: state.pageKey, child: const RoleSelectionScreen()),
       ),
-
-      // Sender Home
       GoRoute(
         path: '/sender',
         pageBuilder: (context, state) =>
             _fadePage(key: state.pageKey, child: const SenderHomeScreen()),
       ),
-
+      GoRoute(
+        path: '/profile_setup',
+        builder: (_, __) => const ProfileSetupScreen(),
+      ),
       // Traveler Home
       GoRoute(
         path: '/traveler',
@@ -66,6 +69,14 @@ final routerProvider = Provider<GoRouter>((ref) {
       GoRoute(
         path: '/admin_home',
         builder: (context, state) => const AdminHomeScreen(),
+      ),
+      GoRoute(
+        path: '/sender-parcels',
+        name: 'senderParcels',
+        builder: (context, state) {
+          final tab = state.uri.queryParameters['tab'];
+          return SenderParcelsScreen(initialTab: tab);
+        },
       ),
       GoRoute(
         path: '/available-traveler/:parcelId',

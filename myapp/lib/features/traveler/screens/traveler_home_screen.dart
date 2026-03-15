@@ -9,8 +9,13 @@ import 'package:geolocator/geolocator.dart';
 import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
 import 'package:image_picker/image_picker.dart';
-import 'package:permission_handler/permission_handler.dart';
+import 'package:myapp/features/auth/screens/login_signup_screen.dart';
+import 'package:permission_handler/permission_handler.dart' hide ServiceStatus;
 import 'package:intl/intl.dart';
+import 'package:flutter_typeahead/flutter_typeahead.dart';
+
+// Import the new wallet screen
+import '../../../screens/wallet_screen.dart';
 
 // ── Brand colours ─────────────────────────────────────────────────────────────
 const _indigo = Color(0xFF4F46E5);
@@ -27,8 +32,16 @@ const _card = Colors.white;
 const _cloudName = 'dwjzuw8fd';
 const _uploadPreset = 'kyc_upload';
 
-/// How long a traveler has to respond before the request auto-expires.
+/// How long a traveler has to respond before the request auto‑expires.
 const _kRequestExpiry = Duration(minutes: 15);
+
+const Map<String, List<String>> cityAreas = {
+  "Nashik": ["Panchavati", "Satpur", "Indira Nagar", "Gangapur Road"],
+  "Pune": ["Kothrud", "Baner", "Hinjewadi", "Wakad", "Shivajinagar"],
+  "Mumbai": ["Andheri", "Bandra", "Borivali", "Dadar", "Powai"],
+  "Aurangabad": ["CIDCO", "Garkheda", "Satara"],
+  "Nagpur": ["Dharampeth", "Sitabuldi", "Manish Nagar"],
+};
 
 // ════════════════════════════════════════════════════════════════════════════
 //  ROOT SCREEN
@@ -45,96 +58,156 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
 
   int _navIndex = 0;
   bool _kycVerified = false;
-  bool _locationGranted = false;
   bool _loading = true;
+
+  // Stream subscription for user doc changes
+  StreamSubscription<DocumentSnapshot>? _userSubscription;
 
   @override
   void initState() {
     super.initState();
-    _syncVerificationFromFirestore();
+    _listenToUserChanges();
   }
 
-  Future<void> _syncVerificationFromFirestore() async {
+  void _listenToUserChanges() {
     final uid = _user?.uid;
     if (uid == null) {
       setState(() => _loading = false);
       return;
     }
-    try {
-      final snap = await FirebaseFirestore.instance
-          .collection('users')
-          .doc(uid)
-          .get();
-      final d = snap.data() ?? {};
-      setState(() {
-        _kycVerified = d['kycVerified'] == true;
-        _locationGranted = d['locationGranted'] == true;
-        _loading = false;
-      });
-    } catch (_) {
-      setState(() => _loading = false);
-    }
+    _userSubscription = FirebaseFirestore.instance
+        .collection('users')
+        .doc(uid)
+        .snapshots()
+        .listen(
+          (snapshot) {
+            if (!mounted) return;
+            final data = snapshot.data() ?? {};
+            setState(() {
+              _kycVerified = data['kycVerified'] == true;
+              _loading = false;
+            });
+          },
+          onError: (e) {
+            debugPrint('Error listening to user: $e');
+            setState(() => _loading = false);
+          },
+        );
   }
 
-  Future<void> _requestRealLocation() async {
-    final serviceOn = await Geolocator.isLocationServiceEnabled();
-    if (!serviceOn) {
+  @override
+  void dispose() {
+    _userSubscription?.cancel();
+    super.dispose();
+  }
+
+  /// Checks location services and permission.
+  /// Returns true if location is available, otherwise shows a message.
+  Future<bool> _checkLocation() async {
+    final serviceEnabled = await Geolocator.isLocationServiceEnabled();
+    if (!serviceEnabled) {
       _toast(
-        '📍 Please turn on Location / GPS in your device settings.',
+        '📍 Please enable location / GPS in your device settings.',
         isError: true,
       );
       await Geolocator.openLocationSettings();
-      return;
+      return false;
     }
-    LocationPermission perm = await Geolocator.checkPermission();
-    if (perm == LocationPermission.deniedForever) {
+    final permission = await Geolocator.checkPermission();
+    if (permission == LocationPermission.denied) {
+      final requested = await Geolocator.requestPermission();
+      if (requested == LocationPermission.denied) {
+        _toast('Location permission denied.', isError: true);
+        return false;
+      }
+    }
+    if (permission == LocationPermission.deniedForever) {
       _toast(
         'Location blocked. Open Settings and allow location for Saarthi.',
         isError: true,
       );
       await openAppSettings();
-      return;
+      return false;
     }
-    if (perm == LocationPermission.denied) {
-      perm = await Geolocator.requestPermission();
-      if (perm == LocationPermission.denied ||
-          perm == LocationPermission.deniedForever) {
-        _toast('Location permission denied.', isError: true);
-        return;
-      }
-    }
-    try {
-      _toast('📍 Getting your location…');
-      final Position pos = await Geolocator.getCurrentPosition(
-        desiredAccuracy: LocationAccuracy.high,
-        timeLimit: const Duration(seconds: 15),
-      );
-      await FirebaseFirestore.instance.collection('users').doc(_user!.uid).set({
-        'locationGranted': true,
-        'lastLatitude': pos.latitude,
-        'lastLongitude': pos.longitude,
-        'locationAccuracy': pos.accuracy,
-        'locationUpdatedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-      setState(() => _locationGranted = true);
+    return true;
+  }
+
+  /// Checks KYC verification and shows a message if not verified.
+  bool _checkKyc() {
+    if (!_kycVerified) {
       _toast(
-        '📍 Location saved (${pos.latitude.toStringAsFixed(4)}, ${pos.longitude.toStringAsFixed(4)})',
+        'Your KYC is under review or you dont submitted kyc request. You cannot perform this action until verification is approved.',
+        isError: true,
       );
-    } on LocationServiceDisabledException {
-      _toast('GPS is disabled.', isError: true);
-    } on PermissionDeniedException {
-      _toast('Permission denied.', isError: true);
-    } catch (e) {
-      _toast('Location error: $e', isError: true);
+      return false;
     }
+    return true;
+  }
+
+  /// Combined check for actions that require both location and KYC.
+  Future<bool> _checkLocationAndKyc() async {
+    if (!_checkKyc()) return false;
+    return await _checkLocation();
   }
 
   Future<void> _updateDeliveryStatus(String parcelId, String newStatus) async {
-    await FirebaseFirestore.instance.collection('parcels').doc(parcelId).update(
-      {'status': newStatus, 'updatedAt': FieldValue.serverTimestamp()},
-    );
+    final parcelRef = FirebaseFirestore.instance
+        .collection('parcels')
+        .doc(parcelId);
+
+    await parcelRef.update({
+      'status': newStatus,
+      'updatedAt': FieldValue.serverTimestamp(),
+    });
+
     if (newStatus == 'delivered') {
-      await _markRouteInactive(parcelId);
+      final parcelSnap = await parcelRef.get();
+      final data = parcelSnap.data();
+
+      final travelerId = data?['travelerId'];
+      final fromCity = data?['fromCity'];
+      final toCity = data?['toCity'];
+
+      final routeQuery = await FirebaseFirestore.instance
+          .collection('travelRoutes')
+          .where('travelerId', isEqualTo: travelerId)
+          .where('fromCity', isEqualTo: fromCity)
+          .where('toCity', isEqualTo: toCity)
+          .limit(1)
+          .get();
+
+      if (routeQuery.docs.isNotEmpty) {
+        await routeQuery.docs.first.reference.update({'status': 'inactive'});
+      }
+
+      await _addEarningsToWallet(parcelId);
+    }
+  }
+
+  Future<void> _addEarningsToWallet(String parcelId) async {
+    try {
+      final parcelSnap = await FirebaseFirestore.instance
+          .collection('parcels')
+          .doc(parcelId)
+          .get();
+      if (!parcelSnap.exists) return;
+      final data = parcelSnap.data()!;
+      final price = (data['price'] as num?)?.toDouble() ?? 0;
+      final travelerId = data['travelerId'] as String?;
+      if (travelerId == null) return;
+
+      final earned = price * 0.70; // 70% to traveler
+
+      await FirebaseFirestore.instance
+          .collection('wallets')
+          .doc(travelerId)
+          .set({
+            'balance': FieldValue.increment(earned),
+            'totalEarnings': FieldValue.increment(earned),
+            'updatedAt': FieldValue.serverTimestamp(),
+          }, SetOptions(merge: true));
+    } catch (e) {
+      debugPrint('_addEarningsToWallet error: $e');
     }
   }
 
@@ -168,6 +241,7 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
 
   Future<void> _signOut() async {
     await FirebaseAuth.instance.signOut();
+    await googleSignIn.signOut();
     if (mounted) context.go('/login');
   }
 
@@ -219,26 +293,30 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
       ),
       builder: (ctx) => _SetupSheet(
         uid: _user?.uid ?? '',
-        locationGranted: _locationGranted,
         kycVerified: _kycVerified,
-        onLocationTap: () async {
-          Navigator.pop(ctx);
-          await _requestRealLocation();
-        },
-        onKycVerified: () {
-          setState(() => _kycVerified = true);
-          _toast('✅ KYC submitted! You can now accept parcels.');
+        onKycSubmitted: () {
+          _toast(
+            '📄 KYC submitted! Please wait for admin approval. You will be notified once verified.',
+          );
         },
       ),
     );
   }
 
-  void _showAddRouteSheet() {
-    String from = 'Nashik', to = 'Pune';
-    final spaceCtrl = TextEditingController();
-    const routeCities = ['Nashik', 'Pune', 'Mumbai', 'Aurangabad', 'Nagpur'];
+  void _showAddRouteSheet() async {
+    // Check KYC and location before opening the sheet.
+    if (!await _checkLocationAndKyc()) return;
+
+    // Local state for the sheet
+    String fromCity = 'Nashik', toCity = 'Pune';
+    String fromArea = '', toArea = '';
+    final fromAddressCtrl = TextEditingController();
+    final toAddressCtrl = TextEditingController();
+    double? fromLat, fromLon, toLat, toLon;
     DateTime? selectedDate;
     TimeOfDay? selectedTime;
+    final spaceCtrl = TextEditingController();
+    const routeCities = ['Nashik', 'Pune', 'Mumbai', 'Aurangabad', 'Nagpur'];
 
     showModalBottomSheet(
       context: context,
@@ -255,137 +333,295 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
           top: 24,
         ),
         child: StatefulBuilder(
-          builder: (ctx, ss) => Column(
-            mainAxisSize: MainAxisSize.min,
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Center(child: _Handle()),
-              const SizedBox(height: 20),
-              const Text(
-                'Add Travel Route',
-                style: TextStyle(
-                  fontSize: 18,
-                  fontWeight: FontWeight.bold,
-                  color: _text1,
-                ),
-              ),
-              const Text(
-                'Tell us your journey so we can match parcels.',
-                style: TextStyle(fontSize: 13, color: _text2),
-              ),
-              const SizedBox(height: 20),
-              Row(
-                children: [
-                  Expanded(
-                    child: _SheetDropdown(
-                      label: 'From',
-                      value: from,
-                      items: routeCities,
-                      onChanged: (v) => ss(() => from = v!),
-                    ),
+          builder: (ctx, setSheetState) => SingleChildScrollView(
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Center(child: _Handle()),
+                const SizedBox(height: 20),
+                const Text(
+                  'Add Travel Route',
+                  style: TextStyle(
+                    fontSize: 18,
+                    fontWeight: FontWeight.bold,
+                    color: _text1,
                   ),
-                  Container(
-                    margin: const EdgeInsets.symmetric(horizontal: 10),
-                    width: 34,
-                    height: 34,
-                    decoration: BoxDecoration(
-                      color: _indigo.withOpacity(0.08),
-                      shape: BoxShape.circle,
-                    ),
-                    child: const Icon(
-                      Icons.arrow_forward_rounded,
-                      color: _indigo,
-                      size: 16,
-                    ),
-                  ),
-                  Expanded(
-                    child: _SheetDropdown(
-                      label: 'To',
-                      value: to,
-                      items: routeCities,
-                      onChanged: (v) => ss(() => to = v!),
-                    ),
-                  ),
-                ],
-              ),
-              const SizedBox(height: 12),
-              GestureDetector(
-                onTap: () async {
-                  final picked = await showDatePicker(
-                    context: context,
-                    initialDate: selectedDate ?? DateTime.now(),
-                    firstDate: DateTime.now(),
-                    lastDate: DateTime.now().add(const Duration(days: 365)),
-                  );
-                  if (picked != null) ss(() => selectedDate = picked);
-                },
-                child: _PickerField(
-                  icon: Icons.calendar_today_outlined,
-                  text: selectedDate != null
-                      ? DateFormat('dd/MM/yyyy').format(selectedDate!)
-                      : 'Select travel date',
-                  hasValue: selectedDate != null,
                 ),
-              ),
-              const SizedBox(height: 12),
-              GestureDetector(
-                onTap: () async {
-                  final picked = await showTimePicker(
-                    context: context,
-                    initialTime: selectedTime ?? TimeOfDay.now(),
-                  );
-                  if (picked != null) ss(() => selectedTime = picked);
-                },
-                child: _PickerField(
-                  icon: Icons.access_time_outlined,
-                  text: selectedTime != null
-                      ? selectedTime!.format(context)
-                      : 'Select travel time',
-                  hasValue: selectedTime != null,
+                const Text(
+                  'Tell us your journey so we can match parcels.',
+                  style: TextStyle(fontSize: 13, color: _text2),
                 ),
-              ),
-              const SizedBox(height: 12),
-              _SheetField(
-                ctrl: spaceCtrl,
-                hint: 'Available bag space (kg)',
-                icon: Icons.luggage_outlined,
-                keyboardType: TextInputType.number,
-              ),
-              const SizedBox(height: 20),
-              _PrimaryBtn(
-                label: 'Save Route',
-                onTap: () async {
-                  final uid = _user?.uid;
-                  if (uid == null) return;
-                  if (selectedDate == null || selectedTime == null) {
-                    _toast('Please select both date and time', isError: true);
-                    return;
-                  }
-                  final travelDateTime = DateTime(
-                    selectedDate!.year,
-                    selectedDate!.month,
-                    selectedDate!.day,
-                    selectedTime!.hour,
-                    selectedTime!.minute,
-                  );
-                  await FirebaseFirestore.instance
-                      .collection('travelRoutes')
-                      .add({
-                        'travelerId': uid,
-                        'travelerName': _user?.displayName ?? '',
-                        'fromCity': from,
-                        'toCity': to,
-                        'travelDateTime': Timestamp.fromDate(travelDateTime),
-                        'bagSpaceKg': double.tryParse(spaceCtrl.text) ?? 0,
-                        'status': 'active',
-                        'createdAt': FieldValue.serverTimestamp(),
+                const SizedBox(height: 20),
+
+                // FROM section
+                const Text(
+                  'From',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: _text2,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _SheetDropdown(
+                        label: 'City',
+                        value: fromCity,
+                        items: routeCities,
+                        onChanged: (val) {
+                          setSheetState(() {
+                            fromCity = val!;
+                            fromArea = ''; // reset area
+                            fromAddressCtrl.clear();
+                            fromLat = fromLon = null;
+                          });
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _SheetDropdown(
+                        label: 'Area',
+                        value: fromArea.isEmpty ? null : fromArea,
+                        items: cityAreas[fromCity] ?? [],
+                        onChanged: (val) =>
+                            setSheetState(() => fromArea = val!),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                // From address autocomplete (only shown if area selected)
+                if (fromArea.isNotEmpty) ...[
+                  AddressAutocompleteField(
+                    controller: fromAddressCtrl,
+                    city: fromCity,
+                    area: fromArea,
+                    hintText: 'Search pickup address (optional)',
+                    prefixIcon: Icons.location_on_outlined,
+                    onSelected: (address, lat, lng) {
+                      setSheetState(() {
+                        fromAddressCtrl.text = address;
+                        fromLat = lat;
+                        fromLon = lng;
                       });
-                  if (ctx.mounted) Navigator.pop(ctx);
-                  _toast('🗺️ Route saved! You\'ll be matched with parcels.');
-                },
-              ),
-              const SizedBox(height: 24),
-            ],
+                    },
+                  ),
+                  if (fromLat != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Row(
+                        children: [
+                          Icon(Icons.check_circle, color: _green, size: 14),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Coordinates set',
+                            style: TextStyle(color: _green, fontSize: 11),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+
+                const SizedBox(height: 16),
+
+                // TO section
+                const Text(
+                  'To',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.w600,
+                    color: _text2,
+                  ),
+                ),
+                const SizedBox(height: 6),
+                Row(
+                  children: [
+                    Expanded(
+                      child: _SheetDropdown(
+                        label: 'City',
+                        value: toCity,
+                        items: routeCities,
+                        onChanged: (val) {
+                          setSheetState(() {
+                            toCity = val!;
+                            toArea = '';
+                            toAddressCtrl.clear();
+                            toLat = toLon = null;
+                          });
+                        },
+                      ),
+                    ),
+                    const SizedBox(width: 10),
+                    Expanded(
+                      child: _SheetDropdown(
+                        label: 'Area',
+                        value: toArea.isEmpty ? null : toArea,
+                        items: cityAreas[toCity] ?? [],
+                        onChanged: (val) => setSheetState(() => toArea = val!),
+                      ),
+                    ),
+                  ],
+                ),
+                const SizedBox(height: 12),
+                // To address autocomplete
+                if (toArea.isNotEmpty) ...[
+                  AddressAutocompleteField(
+                    controller: toAddressCtrl,
+                    city: toCity,
+                    area: toArea,
+                    hintText: 'Search drop address (optional)',
+                    prefixIcon: Icons.location_on_outlined,
+                    onSelected: (address, lat, lng) {
+                      setSheetState(() {
+                        toAddressCtrl.text = address;
+                        toLat = lat;
+                        toLon = lng;
+                      });
+                    },
+                  ),
+                  if (toLat != null)
+                    Padding(
+                      padding: const EdgeInsets.only(top: 4),
+                      child: Row(
+                        children: [
+                          Icon(Icons.check_circle, color: _green, size: 14),
+                          const SizedBox(width: 4),
+                          Text(
+                            'Coordinates set',
+                            style: TextStyle(color: _green, fontSize: 11),
+                          ),
+                        ],
+                      ),
+                    ),
+                ],
+
+                const SizedBox(height: 16),
+
+                // Date & Time
+                GestureDetector(
+                  onTap: () async {
+                    final picked = await showDatePicker(
+                      context: context,
+                      initialDate: selectedDate ?? DateTime.now(),
+                      firstDate: DateTime.now(),
+                      lastDate: DateTime.now().add(const Duration(days: 365)),
+                    );
+                    if (picked != null) {
+                      setSheetState(() => selectedDate = picked);
+                    }
+                  },
+                  child: _PickerField(
+                    icon: Icons.calendar_today_outlined,
+                    text: selectedDate != null
+                        ? DateFormat('dd/MM/yyyy').format(selectedDate!)
+                        : 'Select travel date',
+                    hasValue: selectedDate != null,
+                  ),
+                ),
+                const SizedBox(height: 12),
+                GestureDetector(
+                  onTap: () async {
+                    final picked = await showTimePicker(
+                      context: context,
+                      initialTime: selectedTime ?? TimeOfDay.now(),
+                    );
+                    if (picked != null) {
+                      setSheetState(() => selectedTime = picked);
+                    }
+                  },
+                  child: _PickerField(
+                    icon: Icons.access_time_outlined,
+                    text: selectedTime != null
+                        ? selectedTime!.format(context)
+                        : 'Select travel time',
+                    hasValue: selectedTime != null,
+                  ),
+                ),
+                const SizedBox(height: 12),
+
+                // Bag space
+                _SheetField(
+                  ctrl: spaceCtrl,
+                  hint: 'Available bag space (kg)',
+                  icon: Icons.luggage_outlined,
+                  keyboardType: TextInputType.number,
+                ),
+                const SizedBox(height: 20),
+
+                // Save button
+                _PrimaryBtn(
+                  label: 'Save Route',
+                  onTap: () async {
+                    final uid = _user?.uid;
+                    if (uid == null) return;
+
+                    // Basic validation
+                    if (fromCity.isEmpty || toCity.isEmpty) {
+                      _toast('Please select from/to city', isError: true);
+                      return;
+                    }
+                    if (fromArea.isEmpty || toArea.isEmpty) {
+                      _toast('Please select from/to area', isError: true);
+                      return;
+                    }
+                    if (selectedDate == null || selectedTime == null) {
+                      _toast('Please select both date and time', isError: true);
+                      return;
+                    }
+                    final bagSpace = double.tryParse(spaceCtrl.text);
+                    if (bagSpace == null || bagSpace <= 0) {
+                      _toast(
+                        'Please enter valid bag space (>0)',
+                        isError: true,
+                      );
+                      return;
+                    }
+
+                    final travelDateTime = DateTime(
+                      selectedDate!.year,
+                      selectedDate!.month,
+                      selectedDate!.day,
+                      selectedTime!.hour,
+                      selectedTime!.minute,
+                    );
+
+                    // Prepare data
+                    final routeData = {
+                      'travelerId': uid,
+                      'travelerName': _user?.displayName ?? '',
+                      'fromCity': fromCity,
+                      'fromArea': fromArea,
+                      'toCity': toCity,
+                      'toArea': toArea,
+                      'address': fromAddressCtrl.text,
+                      'latitude': fromLat,
+                      'longitude': fromLon,
+                      'travelDateTime': Timestamp.fromDate(travelDateTime),
+                      'bagSpaceKg': bagSpace,
+                      'status': 'active',
+                      'createdAt': FieldValue.serverTimestamp(),
+                    };
+
+                    try {
+                      await FirebaseFirestore.instance
+                          .collection('travelRoutes')
+                          .add(routeData);
+                      if (ctx.mounted) Navigator.pop(ctx);
+                      _toast(
+                        '🗺️ Route saved! You\'ll be matched with parcels.',
+                      );
+                    } catch (e) {
+                      _toast('Failed to save route: $e', isError: true);
+                    }
+                  },
+                ),
+                const SizedBox(height: 24),
+              ],
+            ),
           ),
         ),
       ),
@@ -396,10 +632,14 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
   //  HANDLE INCOMING REQUESTS
   // ══════════════════════════════════════════════════════════════════════════
   Future<void> _handleRequest(String parcelId, bool accept) async {
-    if (!_kycVerified || !_locationGranted) {
-      _showSetupSheet();
-      return;
+    // Check location and KYC before allowing accept/reject.
+    if (accept) {
+      if (!await _checkLocationAndKyc()) return;
+    } else {
+      // Rejecting might not require location, but still KYC? Let's require both for consistency.
+      if (!await _checkLocationAndKyc()) return;
     }
+
     try {
       if (accept) {
         // Read-before-write guard
@@ -478,7 +718,6 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
       _HomeTab(
         user: _user,
         kycVerified: _kycVerified,
-        locationGranted: _locationGranted,
         incomingStream: _incomingRequests,
         activeStream: _myDeliveries,
         completedStream: _completedDeliveries,
@@ -487,17 +726,21 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
         onUpdateStatus: _updateDeliveryStatus,
         onAddRouteTap: _showAddRouteSheet,
         onSetupTap: _showSetupSheet,
+        onCheckLocation: _checkLocation,
       ),
       _DeliveriesTab(
         stream: _myDeliveries,
         onUpdateStatus: _updateDeliveryStatus,
       ),
-      _WalletTab(completedStream: _completedDeliveries),
+      // New Wallet Screen
+      WalletScreen(
+        userId: _user?.uid ?? '',
+        userName: _user?.displayName ?? 'Traveler',
+      ),
       _RoutesTab(stream: _myRoutes),
       _ProfileTab(
         user: _user,
         kycVerified: _kycVerified,
-        locationGranted: _locationGranted,
         onSetupTap: _showSetupSheet,
         onSignOut: _signOut,
         onSwitchSender: () => context.go('/sender'),
@@ -516,27 +759,30 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SETUP SHEET (unchanged)
+//  SETUP SHEET (extended KYC form with selfie)
 // ════════════════════════════════════════════════════════════════════════════
 class _SetupSheet extends StatefulWidget {
   final String uid;
-  final bool locationGranted;
   final bool kycVerified;
-  final Future<void> Function() onLocationTap;
-  final VoidCallback onKycVerified;
+  final VoidCallback onKycSubmitted;
   const _SetupSheet({
     required this.uid,
-    required this.locationGranted,
     required this.kycVerified,
-    required this.onLocationTap,
-    required this.onKycVerified,
+    required this.onKycSubmitted,
   });
   @override
   State<_SetupSheet> createState() => _SetupSheetState();
 }
 
 class _SetupSheetState extends State<_SetupSheet> {
-  File? _kycFile;
+  // KYC fields
+  final _fullNameController = TextEditingController();
+  final _emailController = TextEditingController();
+  final _dobController = TextEditingController();
+  final _addressController = TextEditingController();
+
+  File? _docFile;
+  File? _selfieFile;
   bool _uploading = false;
   String _docType = 'Aadhaar Card';
   static const _docTypes = [
@@ -547,94 +793,179 @@ class _SetupSheetState extends State<_SetupSheet> {
     'Passport',
   ];
 
-  Future<void> _pickImage(ImageSource source) async {
-    final perm = source == ImageSource.camera
-        ? await Permission.camera.request()
-        : await Permission.photos.request();
-    if (!perm.isGranted) {
+  @override
+  void initState() {
+    super.initState();
+    // Pre-fill email and name from Firebase if available
+    final user = FirebaseAuth.instance.currentUser;
+    if (user != null) {
+      _fullNameController.text = user.displayName ?? '';
+      _emailController.text = user.email ?? '';
+    }
+  }
+
+  @override
+  void dispose() {
+    _fullNameController.dispose();
+    _emailController.dispose();
+    _dobController.dispose();
+    _addressController.dispose();
+    super.dispose();
+  }
+
+  /// Permission handling for camera/gallery.
+  Future<bool> _requestPermission(ImageSource source) async {
+    PermissionStatus status;
+    if (source == ImageSource.camera) {
+      status = await Permission.camera.request();
+    } else {
+      // Gallery: platform‑specific
+      status = await Permission.photos.request();
+    }
+    if (status.isGranted) return true;
+    if (status.isPermanentlyDenied) {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(
-            content: Text('Permission denied. Please allow in Settings.'),
+          SnackBar(
+            content: Text(
+              'Permission permanently denied. Please enable in settings.',
+            ),
             backgroundColor: _red,
             behavior: SnackBarBehavior.floating,
           ),
         );
       }
       await openAppSettings();
-      return;
-    }
-    final picked = await ImagePicker().pickImage(
-      source: source,
-      imageQuality: 85,
-      maxWidth: 1400,
-    );
-    if (picked != null) setState(() => _kycFile = File(picked.path));
-  }
-
-  Future<void> _submitKyc() async {
-    if (_kycFile == null) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Please choose a document photo first.'),
-          backgroundColor: _orange,
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
-      return;
-    }
-    setState(() => _uploading = true);
-    try {
-      final uri = Uri.parse(
-        'https://api.cloudinary.com/v1_1/$_cloudName/image/upload',
-      );
-      final request = http.MultipartRequest('POST', uri)
-        ..fields['upload_preset'] = _uploadPreset
-        ..fields['folder'] = 'kyc_docs'
-        ..fields['context'] = 'uid=${widget.uid}|docType=$_docType'
-        ..files.add(
-          await http.MultipartFile.fromPath(
-            'file',
-            _kycFile!.path,
-            filename: 'kyc_${widget.uid}.jpg',
-          ),
-        );
-      final streamed = await request.send().timeout(
-        const Duration(seconds: 30),
-      );
-      final response = await http.Response.fromStream(streamed);
-      if (response.statusCode != 200) {
-        throw Exception(
-          'Cloudinary error ${response.statusCode}: ${response.body}',
-        );
-      }
-      final body = jsonDecode(response.body) as Map<String, dynamic>;
-      await FirebaseFirestore.instance.collection('users').doc(widget.uid).set({
-        'kycDocUrl': body['secure_url'],
-        'kycDocPublicId': body['public_id'],
-        'kycDocType': _docType,
-        'kycStatus': 'submitted',
-        'kycVerified': true,
-        'kycSubmittedAt': FieldValue.serverTimestamp(),
-      }, SetOptions(merge: true));
-      widget.onKycVerified();
-      if (mounted) Navigator.pop(context);
-    } catch (e) {
+    } else {
       if (mounted) {
         ScaffoldMessenger.of(context).showSnackBar(
           SnackBar(
-            content: Text('Upload failed: $e'),
+            content: Text('Permission denied.'),
             backgroundColor: _red,
             behavior: SnackBarBehavior.floating,
           ),
         );
       }
+    }
+    return false;
+  }
+
+  Future<void> _pickImage(ImageSource source, bool isSelfie) async {
+    if (!await _requestPermission(source)) return;
+    final picked = await ImagePicker().pickImage(
+      source: source,
+      imageQuality: 85,
+      maxWidth: 1400,
+    );
+    if (picked != null) {
+      setState(() {
+        if (isSelfie) {
+          _selfieFile = File(picked.path);
+        } else {
+          _docFile = File(picked.path);
+        }
+      });
+    }
+  }
+
+  Future<void> _submitKyc() async {
+    // Validate all fields
+    if (_fullNameController.text.trim().isEmpty) {
+      _showError('Please enter your full name.');
+      return;
+    }
+    if (_emailController.text.trim().isEmpty) {
+      _showError('Please enter your email.');
+      return;
+    }
+    if (_dobController.text.trim().isEmpty) {
+      _showError('Please select your date of birth.');
+      return;
+    }
+    if (_addressController.text.trim().isEmpty) {
+      _showError('Please enter your address.');
+      return;
+    }
+    if (_docFile == null) {
+      _showError('Please upload a government document photo.');
+      return;
+    }
+    if (_selfieFile == null) {
+      _showError('Please capture a live selfie using the camera.');
+      return;
+    }
+
+    setState(() => _uploading = true);
+
+    try {
+      // Upload document image
+      final docUrl = await _uploadToCloudinary(_docFile!, 'kyc_docs');
+      // Upload selfie image
+      final selfieUrl = await _uploadToCloudinary(_selfieFile!, 'kyc_selfies');
+
+      // Create KYC request document
+      await FirebaseFirestore.instance
+          .collection('kycRequests')
+          .doc(widget.uid)
+          .set({
+            'uid': widget.uid,
+            'fullName': _fullNameController.text.trim(),
+            'email': _emailController.text.trim(),
+            'dateOfBirth': _dobController.text.trim(),
+            'address': _addressController.text.trim(),
+            'documentType': _docType,
+            'documentUrl': docUrl,
+            'selfieUrl': selfieUrl,
+            'status': 'requested',
+            'submittedAt': FieldValue.serverTimestamp(),
+          });
+
+      // Do NOT set kycVerified in users collection.
+      widget.onKycSubmitted();
+      if (mounted) Navigator.pop(context);
+    } catch (e) {
+      _showError('Upload failed: $e');
     } finally {
       if (mounted) setState(() => _uploading = false);
     }
   }
 
-  void _showSourcePicker() {
+  Future<String> _uploadToCloudinary(File file, String folder) async {
+    final uri = Uri.parse(
+      'https://api.cloudinary.com/v1_1/$_cloudName/image/upload',
+    );
+    final request = http.MultipartRequest('POST', uri)
+      ..fields['upload_preset'] = _uploadPreset
+      ..fields['folder'] = folder
+      ..files.add(
+        await http.MultipartFile.fromPath(
+          'file',
+          file.path,
+          filename: '${folder}_${widget.uid}.jpg',
+        ),
+      );
+    final streamed = await request.send().timeout(const Duration(seconds: 30));
+    final response = await http.Response.fromStream(streamed);
+    if (response.statusCode != 200) {
+      throw Exception(
+        'Cloudinary error ${response.statusCode}: ${response.body}',
+      );
+    }
+    final body = jsonDecode(response.body) as Map<String, dynamic>;
+    return body['secure_url'] as String;
+  }
+
+  void _showError(String msg) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(msg),
+        backgroundColor: _red,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  void _showSourcePicker(bool isSelfie) {
     showModalBottomSheet(
       context: context,
       backgroundColor: Colors.white,
@@ -665,21 +996,23 @@ class _SetupSheetState extends State<_SetupSheet> {
                     label: 'Camera',
                     onTap: () {
                       Navigator.pop(context);
-                      _pickImage(ImageSource.camera);
+                      _pickImage(ImageSource.camera, isSelfie);
                     },
                   ),
                 ),
-                const SizedBox(width: 12),
-                Expanded(
-                  child: _SourceCard(
-                    icon: Icons.photo_library_outlined,
-                    label: 'Gallery',
-                    onTap: () {
-                      Navigator.pop(context);
-                      _pickImage(ImageSource.gallery);
-                    },
+                if (!isSelfie) ...[
+                  const SizedBox(width: 12),
+                  Expanded(
+                    child: _SourceCard(
+                      icon: Icons.photo_library_outlined,
+                      label: 'Gallery',
+                      onTap: () {
+                        Navigator.pop(context);
+                        _pickImage(ImageSource.gallery, isSelfie);
+                      },
+                    ),
                   ),
-                ),
+                ],
               ],
             ),
           ],
@@ -690,6 +1023,70 @@ class _SetupSheetState extends State<_SetupSheet> {
 
   @override
   Widget build(BuildContext context) {
+    if (widget.kycVerified) {
+      // If already verified, show a simple message.
+      return Padding(
+        padding: EdgeInsets.only(
+          bottom: MediaQuery.of(context).viewInsets.bottom + 16,
+          left: 24,
+          right: 24,
+          top: 24,
+        ),
+        child: Column(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            _Handle(),
+            const SizedBox(height: 20),
+            Container(
+              width: 62,
+              height: 62,
+              decoration: BoxDecoration(
+                color: _green.withOpacity(0.08),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.verified_user_rounded,
+                color: _green,
+                size: 28,
+              ),
+            ),
+            const SizedBox(height: 12),
+            const Text(
+              'KYC Already Verified',
+              style: TextStyle(
+                fontSize: 18,
+                fontWeight: FontWeight.bold,
+                color: _green,
+              ),
+            ),
+            const SizedBox(height: 6),
+            const Text(
+              'Your identity has been verified. You can now accept parcels and create routes.',
+              textAlign: TextAlign.center,
+              style: TextStyle(fontSize: 13, color: _text2),
+            ),
+            const SizedBox(height: 20),
+            SizedBox(
+              width: double.infinity,
+              child: ElevatedButton(
+                onPressed: () => Navigator.pop(context),
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _indigo,
+                  foregroundColor: Colors.white,
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  elevation: 0,
+                  padding: const EdgeInsets.symmetric(vertical: 14),
+                ),
+                child: const Text('Close'),
+              ),
+            ),
+          ],
+        ),
+      );
+    }
+
     return Padding(
       padding: EdgeInsets.only(
         bottom: MediaQuery.of(context).viewInsets.bottom + 16,
@@ -710,16 +1107,11 @@ class _SetupSheetState extends State<_SetupSheet> {
                 color: _indigo.withOpacity(0.08),
                 shape: BoxShape.circle,
               ),
-              child: const Icon(
-                Icons.verified_user_outlined,
-                color: _indigo,
-                size: 28,
-              ),
+              child: const Icon(Icons.badge_outlined, color: _indigo, size: 28),
             ),
             const SizedBox(height: 12),
             const Text(
-              'Complete Setup to Accept Parcels',
-              textAlign: TextAlign.center,
+              'KYC Verification',
               style: TextStyle(
                 fontSize: 18,
                 fontWeight: FontWeight.bold,
@@ -728,281 +1120,101 @@ class _SetupSheetState extends State<_SetupSheet> {
             ),
             const SizedBox(height: 6),
             const Text(
-              'Both steps are required to protect senders\nand ensure trusted deliveries.',
+              'Please fill in your details and upload the required documents. '
+              'Your submission will be reviewed by an admin.',
               textAlign: TextAlign.center,
-              style: TextStyle(fontSize: 13, color: _text2, height: 1.5),
+              style: TextStyle(fontSize: 13, color: _text2),
             ),
             const SizedBox(height: 24),
-            _StepTile(
-              stepNum: '1',
-              icon: Icons.location_on_outlined,
-              color: _teal,
-              title: 'Allow Location Access',
-              subtitle: 'Shares your live GPS position with senders',
-              done: widget.locationGranted,
-              buttonLabel: 'Grant Now',
-              onTap: widget.locationGranted ? null : widget.onLocationTap,
+
+            // Personal details
+            _buildTextField(
+              controller: _fullNameController,
+              label: 'Full Name',
+              icon: Icons.person_outline,
             ),
             const SizedBox(height: 12),
-            Container(
-              padding: const EdgeInsets.all(16),
-              decoration: BoxDecoration(
-                color: widget.kycVerified
-                    ? _green.withOpacity(0.04)
-                    : _indigo.withOpacity(0.04),
-                borderRadius: BorderRadius.circular(16),
-                border: Border.all(
-                  color: widget.kycVerified
-                      ? _green.withOpacity(0.25)
-                      : _indigo.withOpacity(0.2),
-                ),
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  Row(
-                    children: [
-                      _StepCircle(num: '2', done: widget.kycVerified),
-                      const SizedBox(width: 10),
-                      Container(
-                        width: 36,
-                        height: 36,
-                        decoration: BoxDecoration(
-                          color: (widget.kycVerified ? _green : _indigo)
-                              .withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: Icon(
-                          widget.kycVerified
-                              ? Icons.check_circle_rounded
-                              : Icons.badge_outlined,
-                          color: widget.kycVerified ? _green : _indigo,
-                          size: 18,
-                        ),
-                      ),
-                      const SizedBox(width: 10),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Text(
-                              'KYC Verification',
-                              style: TextStyle(
-                                fontSize: 14,
-                                fontWeight: FontWeight.bold,
-                                color: widget.kycVerified ? _green : _text1,
-                              ),
-                            ),
-                            Text(
-                              widget.kycVerified
-                                  ? 'Document uploaded & verified ✓'
-                                  : 'Upload a valid Govt ID (Aadhaar / PAN / Voter ID)',
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: _text2,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                    ],
-                  ),
-                  if (!widget.kycVerified) ...[
-                    const SizedBox(height: 16),
-                    const Divider(color: Color(0xFFE2E8F0), height: 1),
-                    const SizedBox(height: 16),
-                    const Text(
-                      'Document Type',
-                      style: TextStyle(
-                        fontSize: 12,
-                        fontWeight: FontWeight.w600,
-                        color: _text2,
-                      ),
-                    ),
-                    const SizedBox(height: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(horizontal: 12),
-                      decoration: BoxDecoration(
-                        color: Colors.white,
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: const Color(0xFFE2E8F0)),
-                      ),
-                      child: DropdownButtonHideUnderline(
-                        child: DropdownButton<String>(
-                          value: _docType,
-                          isExpanded: true,
-                          style: const TextStyle(
-                            fontSize: 14,
-                            color: _text1,
-                            fontWeight: FontWeight.w500,
-                          ),
-                          icon: const Icon(
-                            Icons.keyboard_arrow_down_rounded,
-                            size: 18,
-                            color: _text2,
-                          ),
-                          items: _docTypes
-                              .map(
-                                (t) =>
-                                    DropdownMenuItem(value: t, child: Text(t)),
-                              )
-                              .toList(),
-                          onChanged: (v) => setState(() => _docType = v!),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    GestureDetector(
-                      onTap: _showSourcePicker,
-                      child: AnimatedContainer(
-                        duration: const Duration(milliseconds: 200),
-                        width: double.infinity,
-                        height: _kycFile != null ? 190 : 110,
-                        decoration: BoxDecoration(
-                          color: Colors.white,
-                          borderRadius: BorderRadius.circular(14),
-                          border: Border.all(
-                            color: _kycFile != null
-                                ? _indigo.withOpacity(0.5)
-                                : const Color(0xFFCBD5E1),
-                            width: _kycFile != null ? 1.5 : 1,
-                          ),
-                        ),
-                        child: _kycFile != null
-                            ? Stack(
-                                fit: StackFit.expand,
-                                children: [
-                                  ClipRRect(
-                                    borderRadius: BorderRadius.circular(13),
-                                    child: Image.file(
-                                      _kycFile!,
-                                      fit: BoxFit.cover,
-                                    ),
-                                  ),
-                                  Positioned(
-                                    top: 8,
-                                    right: 8,
-                                    child: GestureDetector(
-                                      onTap: _showSourcePicker,
-                                      child: Container(
-                                        padding: const EdgeInsets.symmetric(
-                                          horizontal: 10,
-                                          vertical: 5,
-                                        ),
-                                        decoration: BoxDecoration(
-                                          color: Colors.black54,
-                                          borderRadius: BorderRadius.circular(
-                                            8,
-                                          ),
-                                        ),
-                                        child: const Row(
-                                          mainAxisSize: MainAxisSize.min,
-                                          children: [
-                                            Icon(
-                                              Icons.edit_outlined,
-                                              color: Colors.white,
-                                              size: 12,
-                                            ),
-                                            SizedBox(width: 4),
-                                            Text(
-                                              'Change',
-                                              style: TextStyle(
-                                                color: Colors.white,
-                                                fontSize: 11,
-                                              ),
-                                            ),
-                                          ],
-                                        ),
-                                      ),
-                                    ),
-                                  ),
-                                ],
-                              )
-                            : Column(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  Container(
-                                    width: 44,
-                                    height: 44,
-                                    decoration: BoxDecoration(
-                                      color: _indigo.withOpacity(0.08),
-                                      shape: BoxShape.circle,
-                                    ),
-                                    child: const Icon(
-                                      Icons.upload_file_outlined,
-                                      color: _indigo,
-                                      size: 22,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 8),
-                                  const Text(
-                                    'Tap to upload document photo',
-                                    style: TextStyle(
-                                      fontSize: 13,
-                                      fontWeight: FontWeight.w600,
-                                      color: _indigo,
-                                    ),
-                                  ),
-                                  const SizedBox(height: 2),
-                                  const Text(
-                                    'Camera or Gallery • JPG/PNG',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: _text2,
-                                    ),
-                                  ),
-                                ],
-                              ),
-                      ),
-                    ),
-                    const SizedBox(height: 14),
-                    SizedBox(
-                      width: double.infinity,
-                      height: 50,
-                      child: ElevatedButton(
-                        onPressed: _uploading ? null : _submitKyc,
-                        style: ElevatedButton.styleFrom(
-                          backgroundColor: _indigo,
-                          foregroundColor: Colors.white,
-                          disabledBackgroundColor: _indigo.withOpacity(0.5),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(14),
-                          ),
-                          elevation: 0,
-                        ),
-                        child: _uploading
-                            ? const Row(
-                                mainAxisAlignment: MainAxisAlignment.center,
-                                children: [
-                                  SizedBox(
-                                    width: 18,
-                                    height: 18,
-                                    child: CircularProgressIndicator(
-                                      color: Colors.white,
-                                      strokeWidth: 2,
-                                    ),
-                                  ),
-                                  SizedBox(width: 12),
-                                  Text(
-                                    'Uploading…',
-                                    style: TextStyle(fontSize: 14),
-                                  ),
-                                ],
-                              )
-                            : const Text(
-                                'Submit KYC Document',
-                                style: TextStyle(
-                                  fontSize: 15,
-                                  fontWeight: FontWeight.w600,
-                                ),
-                              ),
-                      ),
-                    ),
-                  ],
-                ],
+            _buildTextField(
+              controller: _emailController,
+              label: 'Email',
+              icon: Icons.email_outlined,
+              keyboardType: TextInputType.emailAddress,
+            ),
+            const SizedBox(height: 12),
+            GestureDetector(
+              onTap: () async {
+                final picked = await showDatePicker(
+                  context: context,
+                  initialDate: DateTime.now(),
+                  firstDate: DateTime(1900),
+                  lastDate: DateTime.now(),
+                );
+                if (picked != null) {
+                  _dobController.text = DateFormat('yyyy-MM-dd').format(picked);
+                }
+              },
+              child: _buildReadOnlyField(
+                controller: _dobController,
+                label: 'Date of Birth',
+                icon: Icons.calendar_today_outlined,
               ),
             ),
-            const SizedBox(height: 14),
+            const SizedBox(height: 12),
+            _buildTextField(
+              controller: _addressController,
+              label: 'Address',
+              icon: Icons.location_on_outlined,
+              maxLines: 2,
+            ),
+            const SizedBox(height: 16),
+
+            // Document type dropdown
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 12),
+              decoration: BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.circular(12),
+                border: Border.all(color: const Color(0xFFE2E8F0)),
+              ),
+              child: DropdownButtonHideUnderline(
+                child: DropdownButton<String>(
+                  value: _docType,
+                  isExpanded: true,
+                  style: const TextStyle(
+                    fontSize: 14,
+                    color: _text1,
+                    fontWeight: FontWeight.w500,
+                  ),
+                  icon: const Icon(
+                    Icons.keyboard_arrow_down_rounded,
+                    size: 18,
+                    color: _text2,
+                  ),
+                  items: _docTypes
+                      .map((t) => DropdownMenuItem(value: t, child: Text(t)))
+                      .toList(),
+                  onChanged: (v) => setState(() => _docType = v!),
+                ),
+              ),
+            ),
+            const SizedBox(height: 16),
+
+            // Document upload
+            _buildImagePicker(
+              file: _docFile,
+              label: 'Government Document',
+              isSelfie: false,
+            ),
+            const SizedBox(height: 12),
+
+            // Selfie capture
+            _buildImagePicker(
+              file: _selfieFile,
+              label: 'Live Selfie (Camera only)',
+              isSelfie: true,
+            ),
+            const SizedBox(height: 12),
+
             Container(
               padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 10),
               decoration: BoxDecoration(
@@ -1016,7 +1228,7 @@ class _SetupSheetState extends State<_SetupSheet> {
                   SizedBox(width: 8),
                   Expanded(
                     child: Text(
-                      'Your document is encrypted & stored securely on Cloudinary. '
+                      'Your documents are encrypted and stored securely. '
                       'Used only for identity verification.',
                       style: TextStyle(
                         fontSize: 11,
@@ -1028,9 +1240,225 @@ class _SetupSheetState extends State<_SetupSheet> {
                 ],
               ),
             ),
+            const SizedBox(height: 16),
+
+            SizedBox(
+              width: double.infinity,
+              height: 50,
+              child: ElevatedButton(
+                onPressed: _uploading ? null : _submitKyc,
+                style: ElevatedButton.styleFrom(
+                  backgroundColor: _indigo,
+                  foregroundColor: Colors.white,
+                  disabledBackgroundColor: _indigo.withOpacity(0.5),
+                  shape: RoundedRectangleBorder(
+                    borderRadius: BorderRadius.circular(14),
+                  ),
+                  elevation: 0,
+                ),
+                child: _uploading
+                    ? const Row(
+                        mainAxisAlignment: MainAxisAlignment.center,
+                        children: [
+                          SizedBox(
+                            width: 18,
+                            height: 18,
+                            child: CircularProgressIndicator(
+                              color: Colors.white,
+                              strokeWidth: 2,
+                            ),
+                          ),
+                          SizedBox(width: 12),
+                          Text('Uploading…', style: TextStyle(fontSize: 14)),
+                        ],
+                      )
+                    : const Text(
+                        'Submit KYC for Review',
+                        style: TextStyle(
+                          fontSize: 15,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+              ),
+            ),
             const SizedBox(height: 20),
           ],
         ),
+      ),
+    );
+  }
+
+  Widget _buildTextField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+    TextInputType? keyboardType,
+    int maxLines = 1,
+  }) {
+    return TextField(
+      controller: controller,
+      keyboardType: keyboardType,
+      maxLines: maxLines,
+      decoration: InputDecoration(
+        labelText: label,
+        prefixIcon: Icon(icon, size: 18, color: _text2),
+        filled: true,
+        fillColor: const Color(0xFFF8FAFF),
+        border: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: BorderSide.none,
+        ),
+        enabledBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: Color(0xFFE2E8F0)),
+        ),
+        focusedBorder: OutlineInputBorder(
+          borderRadius: BorderRadius.circular(12),
+          borderSide: const BorderSide(color: _indigo, width: 2),
+        ),
+        contentPadding: const EdgeInsets.symmetric(
+          horizontal: 16,
+          vertical: 13,
+        ),
+      ),
+    );
+  }
+
+  Widget _buildReadOnlyField({
+    required TextEditingController controller,
+    required String label,
+    required IconData icon,
+  }) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
+      decoration: BoxDecoration(
+        color: const Color(0xFFF8FAFF),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFFE2E8F0)),
+      ),
+      child: Row(
+        children: [
+          Icon(icon, size: 18, color: _text2),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Text(
+              controller.text.isEmpty ? label : controller.text,
+              style: TextStyle(
+                fontSize: 14,
+                color: controller.text.isEmpty ? _text2 : _text1,
+              ),
+            ),
+          ),
+          const Icon(
+            Icons.keyboard_arrow_down_rounded,
+            size: 18,
+            color: _text2,
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildImagePicker({
+    required File? file,
+    required String label,
+    required bool isSelfie,
+  }) {
+    return GestureDetector(
+      onTap: () => _showSourcePicker(isSelfie),
+      child: AnimatedContainer(
+        duration: const Duration(milliseconds: 200),
+        width: double.infinity,
+        height: file != null ? 150 : 100,
+        decoration: BoxDecoration(
+          color: Colors.white,
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(
+            color: file != null
+                ? _indigo.withOpacity(0.5)
+                : const Color(0xFFCBD5E1),
+            width: file != null ? 1.5 : 1,
+          ),
+        ),
+        child: file != null
+            ? Stack(
+                fit: StackFit.expand,
+                children: [
+                  ClipRRect(
+                    borderRadius: BorderRadius.circular(13),
+                    child: Image.file(file, fit: BoxFit.cover),
+                  ),
+                  Positioned(
+                    top: 8,
+                    right: 8,
+                    child: GestureDetector(
+                      onTap: () => _showSourcePicker(isSelfie),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 10,
+                          vertical: 5,
+                        ),
+                        decoration: BoxDecoration(
+                          color: Colors.black54,
+                          borderRadius: BorderRadius.circular(8),
+                        ),
+                        child: const Row(
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Icon(
+                              Icons.edit_outlined,
+                              color: Colors.white,
+                              size: 12,
+                            ),
+                            SizedBox(width: 4),
+                            Text(
+                              'Change',
+                              style: TextStyle(
+                                color: Colors.white,
+                                fontSize: 11,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                    ),
+                  ),
+                ],
+              )
+            : Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  Container(
+                    width: 44,
+                    height: 44,
+                    decoration: BoxDecoration(
+                      color: _indigo.withOpacity(0.08),
+                      shape: BoxShape.circle,
+                    ),
+                    child: Icon(
+                      isSelfie
+                          ? Icons.camera_alt_outlined
+                          : Icons.upload_file_outlined,
+                      color: _indigo,
+                      size: 22,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Text(
+                    label,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w600,
+                      color: _indigo,
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  Text(
+                    isSelfie ? 'Camera only' : 'Camera or Gallery • JPG/PNG',
+                    style: const TextStyle(fontSize: 11, color: _text2),
+                  ),
+                ],
+              ),
       ),
     );
   }
@@ -1041,18 +1469,18 @@ class _SetupSheetState extends State<_SetupSheet> {
 // ════════════════════════════════════════════════════════════════════════════
 class _HomeTab extends StatelessWidget {
   final User? user;
-  final bool kycVerified, locationGranted;
+  final bool kycVerified;
   final Stream<QuerySnapshot> incomingStream;
   final Stream<QuerySnapshot> activeStream, completedStream;
   final Future<void> Function(String, bool) onHandleRequest;
   final Future<void> Function(String, String) onExpireRequest;
   final Future<void> Function(String, String) onUpdateStatus;
   final VoidCallback onAddRouteTap, onSetupTap;
+  final Future<bool> Function() onCheckLocation;
 
   const _HomeTab({
     required this.user,
     required this.kycVerified,
-    required this.locationGranted,
     required this.incomingStream,
     required this.activeStream,
     required this.completedStream,
@@ -1061,6 +1489,7 @@ class _HomeTab extends StatelessWidget {
     required this.onUpdateStatus,
     required this.onAddRouteTap,
     required this.onSetupTap,
+    required this.onCheckLocation,
   });
 
   String get _greeting {
@@ -1069,8 +1498,6 @@ class _HomeTab extends StatelessWidget {
     if (h < 17) return 'Good afternoon';
     return 'Good evening';
   }
-
-  bool get _fullySetup => kycVerified && locationGranted;
 
   @override
   Widget build(BuildContext context) {
@@ -1119,7 +1546,7 @@ class _HomeTab extends StatelessWidget {
                                       )
                                     : null,
                               ),
-                              if (_fullySetup)
+                              if (kycVerified)
                                 Positioned(
                                   right: 0,
                                   bottom: 0,
@@ -1172,10 +1599,10 @@ class _HomeTab extends StatelessWidget {
                               ),
                               const SizedBox(height: 4),
                               _HBadge(
-                                label: _fullySetup
+                                label: kycVerified
                                     ? '✅ Verified'
-                                    : '⚠️ Setup Needed',
-                                bg: _fullySetup
+                                    : '⏳ KYC Pending',
+                                bg: kycVerified
                                     ? _green.withOpacity(0.3)
                                     : _orange.withOpacity(0.35),
                               ),
@@ -1206,7 +1633,7 @@ class _HomeTab extends StatelessWidget {
                               const SizedBox(width: 20),
                               _QStat(
                                 label: 'Status',
-                                value: _fullySetup ? 'Active' : 'Pending',
+                                value: kycVerified ? 'Active' : 'Pending',
                               ),
                             ],
                           );
@@ -1226,17 +1653,28 @@ class _HomeTab extends StatelessWidget {
             child: Column(
               crossAxisAlignment: CrossAxisAlignment.start,
               children: [
-                if (!_fullySetup) ...[
-                  _SetupBanner(
-                    locationGranted: locationGranted,
-                    kycVerified: kycVerified,
-                    onTap: onSetupTap,
-                  ),
+                // KYC pending banner
+                if (!kycVerified) ...[
+                  _KycPendingBanner(onSetupTap: onSetupTap),
                   const SizedBox(height: 16),
                 ],
+
+                // Location disabled banner (real‑time check)
+                StreamBuilder<ServiceStatus>(
+                  stream: Geolocator.getServiceStatusStream(),
+                  builder: (context, snapshot) {
+                    if (snapshot.hasData &&
+                        snapshot.data == ServiceStatus.disabled) {
+                      return _LocationDisabledBanner();
+                    }
+                    return const SizedBox.shrink();
+                  },
+                ),
+                const SizedBox(height: 16),
+
                 _AddRouteCard(onTap: onAddRouteTap),
                 const SizedBox(height: 22),
-                _EarningCard(stream: completedStream),
+                _EarningCard(userId: user?.uid ?? ''),
                 const SizedBox(height: 22),
 
                 // ── Incoming Requests ──────────────────────────────────────
@@ -1294,22 +1732,146 @@ class _HomeTab extends StatelessWidget {
   }
 }
 
+// Banner for KYC pending
+class _KycPendingBanner extends StatelessWidget {
+  final VoidCallback onSetupTap;
+  const _KycPendingBanner({required this.onSetupTap});
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onSetupTap,
+      child: Container(
+        padding: const EdgeInsets.all(14),
+        decoration: BoxDecoration(
+          gradient: const LinearGradient(
+            colors: [Color(0xFFFFF7ED), Color(0xFFFFEDD5)],
+          ),
+          borderRadius: BorderRadius.circular(16),
+          border: Border.all(color: _orange.withOpacity(0.3)),
+        ),
+        child: Row(
+          children: [
+            Container(
+              width: 40,
+              height: 40,
+              decoration: BoxDecoration(
+                color: _orange.withOpacity(0.15),
+                shape: BoxShape.circle,
+              ),
+              child: const Icon(
+                Icons.access_time_rounded,
+                color: _orange,
+                size: 20,
+              ),
+            ),
+            const SizedBox(width: 12),
+            Expanded(
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  const Text(
+                    'KYC verification pending',
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.bold,
+                      color: Color(0xFF92400E),
+                    ),
+                  ),
+                  const SizedBox(height: 2),
+                  const Text(
+                    'Please wait for admin approval.',
+                    style: TextStyle(fontSize: 11, color: _orange),
+                  ),
+                ],
+              ),
+            ),
+            const Icon(
+              Icons.arrow_forward_ios_rounded,
+              size: 12,
+              color: _orange,
+            ),
+          ],
+        ),
+      ),
+    );
+  }
+}
+
+// Banner for location disabled
+class _LocationDisabledBanner extends StatelessWidget {
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.all(14),
+      decoration: BoxDecoration(
+        gradient: const LinearGradient(
+          colors: [Color(0xFFFFF0F0), Color(0xFFFFE0E0)],
+        ),
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _red.withOpacity(0.3)),
+      ),
+      child: Row(
+        children: [
+          Container(
+            width: 40,
+            height: 40,
+            decoration: BoxDecoration(
+              color: _red.withOpacity(0.15),
+              shape: BoxShape.circle,
+            ),
+            child: const Icon(
+              Icons.location_off_rounded,
+              color: _red,
+              size: 20,
+            ),
+          ),
+          const SizedBox(width: 12),
+          const Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  'Location services are off',
+                  style: TextStyle(
+                    fontSize: 13,
+                    fontWeight: FontWeight.bold,
+                    color: Color(0xFF7F1D1D),
+                  ),
+                ),
+                SizedBox(height: 2),
+                Text(
+                  'Please enable GPS to accept parcels.',
+                  style: TextStyle(fontSize: 11, color: _red),
+                ),
+              ],
+            ),
+          ),
+          TextButton(
+            onPressed: () async {
+              await Geolocator.openLocationSettings();
+            },
+            style: TextButton.styleFrom(
+              foregroundColor: _red,
+              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(8),
+                side: BorderSide(color: _red.withOpacity(0.4)),
+              ),
+            ),
+            child: const Text(
+              'Open Settings',
+              style: TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 // ════════════════════════════════════════════════════════════════════════════
-//  REQUEST CARD  ←  THIS IS WHERE THE TIMER LIVES
-//
-//  On mount:
-//    • If already expired → calls onExpire immediately (Firestore write)
-//    • If not yet expired → starts a countdown Timer for the remaining window
-//
-//  The Timer fires EXACTLY when 15 minutes have elapsed since requestedAt.
-//  On fire → calls onExpire which:
-//      status = 'pending'
-//      travelerId = null
-//      travelerName = null
-//      ignoredTravelers = arrayUnion([travelerId])
-//
-//  A 1-second ticker keeps the UI countdown up-to-date until expiry.
-//  Both timers are cancelled in dispose() — no leaks.
+//  REQUEST CARD (unchanged timer logic)
 // ════════════════════════════════════════════════════════════════════════════
 class _RequestCard extends StatefulWidget {
   final Map<String, dynamic> data;
@@ -1331,13 +1893,12 @@ class _RequestCard extends StatefulWidget {
 }
 
 class _RequestCardState extends State<_RequestCard> {
-  // ── Timer state ────────────────────────────────────────────────────────────
-  Timer? _expiryTimer; // fires once at the exact expiry moment
-  Timer? _tickTimer; // fires every second to refresh the countdown label
+  Timer? _expiryTimer;
+  Timer? _tickTimer;
   Duration _remaining = Duration.zero;
   bool _expired = false;
   bool _handling = false;
-  bool _expiryCalled = false; // guard so we only call onExpire once
+  bool _expiryCalled = false;
 
   @override
   void initState() {
@@ -1348,7 +1909,6 @@ class _RequestCardState extends State<_RequestCard> {
   @override
   void didUpdateWidget(_RequestCard oldWidget) {
     super.didUpdateWidget(oldWidget);
-    // If the parcel document is updated (e.g. re-sent) restart the timer.
     if (oldWidget.data['requestedAt'] != widget.data['requestedAt']) {
       _cancelTimers();
       _expiryCalled = false;
@@ -1370,11 +1930,9 @@ class _RequestCardState extends State<_RequestCard> {
     _tickTimer = null;
   }
 
-  /// Calculates how much time is left and arms the appropriate timers.
   void _initTimer() {
     final requestedAt = widget.data['requestedAt'] as Timestamp?;
     if (requestedAt == null) {
-      // No timestamp → treat as expired immediately
       setState(() {
         _expired = true;
         _remaining = Duration.zero;
@@ -1386,7 +1944,6 @@ class _RequestCardState extends State<_RequestCard> {
     final elapsed = DateTime.now().difference(requestedAt.toDate());
 
     if (elapsed >= _kRequestExpiry) {
-      // Already past the window when the card was first built
       setState(() {
         _expired = true;
         _remaining = Duration.zero;
@@ -1395,14 +1952,12 @@ class _RequestCardState extends State<_RequestCard> {
       return;
     }
 
-    // Still within the window — calculate precise remaining duration
     final remaining = _kRequestExpiry - elapsed;
     setState(() {
       _remaining = remaining;
       _expired = false;
     });
 
-    // ── One-shot expiry timer ─────────────────────────────────────────────
     _expiryTimer = Timer(remaining, () {
       if (!mounted) return;
       setState(() {
@@ -1412,7 +1967,6 @@ class _RequestCardState extends State<_RequestCard> {
       _doExpire();
     });
 
-    // ── Countdown ticker: updates display every second ────────────────────
     _tickTimer = Timer.periodic(const Duration(seconds: 1), (_) {
       if (!mounted) return;
       final newElapsed = DateTime.now().difference(requestedAt.toDate());
@@ -1429,7 +1983,6 @@ class _RequestCardState extends State<_RequestCard> {
     });
   }
 
-  /// Calls the parent's expiry callback exactly once, then writes to Firestore.
   void _doExpire() {
     if (_expiryCalled) return;
     _expiryCalled = true;
@@ -1439,13 +1992,12 @@ class _RequestCardState extends State<_RequestCard> {
   }
 
   Future<void> _handle(bool accept) async {
-    _cancelTimers(); // stop the timer before the async action
+    _cancelTimers();
     setState(() => _handling = true);
     await widget.onHandle(widget.docId, accept);
     if (mounted) setState(() => _handling = false);
   }
 
-  /// Formats remaining duration as "14 min 32 sec" or "45 sec"
   String get _countdownLabel {
     final m = _remaining.inMinutes;
     final s = _remaining.inSeconds % 60;
@@ -1453,7 +2005,6 @@ class _RequestCardState extends State<_RequestCard> {
     return '${s}s left';
   }
 
-  /// Formats elapsed time as "Requested 3 minutes ago"
   String _timeAgo(Timestamp? ts) {
     if (ts == null) return 'Unknown time';
     final diff = DateTime.now().difference(ts.toDate());
@@ -1464,7 +2015,6 @@ class _RequestCardState extends State<_RequestCard> {
     return 'Requested ${diff.inHours} hour${diff.inHours == 1 ? '' : 's'} ago';
   }
 
-  // ── Countdown colour (green → orange → red as time runs out) ─────────────
   Color get _countdownColor {
     final fraction = _remaining.inSeconds / _kRequestExpiry.inSeconds;
     if (fraction > 0.5) return _teal;
@@ -1491,7 +2041,6 @@ class _RequestCardState extends State<_RequestCard> {
         child: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            // ── Route + category row ───────────────────────────────────────
             Row(
               children: [
                 Container(
@@ -1534,8 +2083,6 @@ class _RequestCardState extends State<_RequestCard> {
                 ),
               ],
             ),
-
-            // ── "Requested X min ago" ──────────────────────────────────────
             if (requestedAt != null) ...[
               const SizedBox(height: 6),
               Row(
@@ -1559,8 +2106,6 @@ class _RequestCardState extends State<_RequestCard> {
                 ],
               ),
             ],
-
-            // ── Live countdown bar (hidden once expired) ───────────────────
             if (!_expired && _remaining.inSeconds > 0) ...[
               const SizedBox(height: 10),
               Row(
@@ -1601,8 +2146,6 @@ class _RequestCardState extends State<_RequestCard> {
                 ),
               ),
             ],
-
-            // ── Expired warning banner ─────────────────────────────────────
             if (_expired) ...[
               const SizedBox(height: 10),
               Container(
@@ -1632,10 +2175,7 @@ class _RequestCardState extends State<_RequestCard> {
                 ),
               ),
             ],
-
             const SizedBox(height: 12),
-
-            // ── Reject / Accept buttons ────────────────────────────────────
             Row(
               children: [
                 Expanded(
@@ -1666,7 +2206,6 @@ class _RequestCardState extends State<_RequestCard> {
                   child: SizedBox(
                     height: 40,
                     child: ElevatedButton.icon(
-                      // Disabled if expired OR already handling
                       onPressed: (_handling || _expired)
                           ? null
                           : () => _handle(true),
@@ -1709,7 +2248,7 @@ class _RequestCardState extends State<_RequestCard> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  DELIVERIES TAB (unchanged)
+//  DELIVERIES TAB
 // ════════════════════════════════════════════════════════════════════════════
 class _DeliveriesTab extends StatelessWidget {
   final Stream<QuerySnapshot> stream;
@@ -1752,186 +2291,7 @@ class _DeliveriesTab extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  WALLET TAB (unchanged)
-// ════════════════════════════════════════════════════════════════════════════
-class _WalletTab extends StatelessWidget {
-  final Stream<QuerySnapshot> completedStream;
-  const _WalletTab({required this.completedStream});
-
-  @override
-  Widget build(BuildContext context) => Scaffold(
-    backgroundColor: _bg,
-    appBar: _Appbar(title: 'Wallet'),
-    body: StreamBuilder<QuerySnapshot>(
-      stream: completedStream,
-      builder: (_, snap) {
-        double total = 0, weekly = 0;
-        final now = DateTime.now();
-        final docs = snap.data?.docs ?? [];
-        for (final doc in docs) {
-          final d = doc.data() as Map<String, dynamic>;
-          final p = (d['price'] as num?)?.toDouble() ?? 0;
-          total += p;
-          final ts = d['createdAt'] as Timestamp?;
-          if (ts != null && now.difference(ts.toDate()).inDays <= 7)
-            weekly += p;
-        }
-        return ListView(
-          padding: const EdgeInsets.all(16),
-          children: [
-            Container(
-              padding: const EdgeInsets.all(24),
-              decoration: BoxDecoration(
-                gradient: const LinearGradient(
-                  colors: [_teal, Color(0xFF0D9488)],
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                ),
-                borderRadius: BorderRadius.circular(22),
-                boxShadow: [
-                  BoxShadow(
-                    color: _teal.withOpacity(0.35),
-                    blurRadius: 16,
-                    offset: const Offset(0, 6),
-                  ),
-                ],
-              ),
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Total Earnings',
-                    style: TextStyle(fontSize: 13, color: Colors.white70),
-                  ),
-                  const SizedBox(height: 6),
-                  Text(
-                    '₹${total.toStringAsFixed(0)}',
-                    style: const TextStyle(
-                      fontSize: 38,
-                      fontWeight: FontWeight.bold,
-                      color: Colors.white,
-                    ),
-                  ),
-                  const SizedBox(height: 16),
-                  Row(
-                    children: [
-                      _WStat(
-                        label: 'This Week',
-                        value: '₹${weekly.toStringAsFixed(0)}',
-                      ),
-                      const SizedBox(width: 28),
-                      _WStat(label: 'Deliveries', value: '${docs.length}'),
-                    ],
-                  ),
-                ],
-              ),
-            ),
-            const SizedBox(height: 24),
-            const Text(
-              'Recent Deliveries',
-              style: TextStyle(
-                fontSize: 16,
-                fontWeight: FontWeight.bold,
-                color: _text1,
-              ),
-            ),
-            const SizedBox(height: 12),
-            if (docs.isEmpty)
-              _InfoCard(
-                icon: '💰',
-                text: 'Complete deliveries to see earnings here.',
-                color: _text2,
-              )
-            else
-              ...docs.map((doc) {
-                final d = doc.data() as Map<String, dynamic>;
-                return Container(
-                  margin: const EdgeInsets.only(bottom: 10),
-                  padding: const EdgeInsets.all(14),
-                  decoration: BoxDecoration(
-                    color: _card,
-                    borderRadius: BorderRadius.circular(14),
-                    border: Border.all(color: const Color(0xFFE2E8F0)),
-                  ),
-                  child: Row(
-                    children: [
-                      Container(
-                        width: 38,
-                        height: 38,
-                        decoration: BoxDecoration(
-                          color: _green.withOpacity(0.1),
-                          borderRadius: BorderRadius.circular(10),
-                        ),
-                        child: const Icon(
-                          Icons.check_circle_outline_rounded,
-                          color: _green,
-                          size: 18,
-                        ),
-                      ),
-                      const SizedBox(width: 12),
-                      Expanded(
-                        child: Column(
-                          crossAxisAlignment: CrossAxisAlignment.start,
-                          children: [
-                            Row(
-                              children: [
-                                Text(
-                                  d['fromCity'] ?? '',
-                                  style: const TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.bold,
-                                    color: _text1,
-                                  ),
-                                ),
-                                const Padding(
-                                  padding: EdgeInsets.symmetric(horizontal: 4),
-                                  child: Icon(
-                                    Icons.arrow_forward_rounded,
-                                    size: 11,
-                                    color: _text2,
-                                  ),
-                                ),
-                                Text(
-                                  d['toCity'] ?? '',
-                                  style: const TextStyle(
-                                    fontSize: 13,
-                                    fontWeight: FontWeight.bold,
-                                    color: _text1,
-                                  ),
-                                ),
-                              ],
-                            ),
-                            Text(
-                              d['category'] ?? d['description'] ?? 'Parcel',
-                              style: const TextStyle(
-                                fontSize: 11,
-                                color: _text2,
-                              ),
-                            ),
-                          ],
-                        ),
-                      ),
-                      Text(
-                        '+ ₹${d['price'] ?? 0}',
-                        style: const TextStyle(
-                          fontSize: 15,
-                          fontWeight: FontWeight.bold,
-                          color: _green,
-                        ),
-                      ),
-                    ],
-                  ),
-                );
-              }),
-          ],
-        );
-      },
-    ),
-  );
-}
-
-// ════════════════════════════════════════════════════════════════════════════
-//  ROUTES TAB (unchanged)
+//  ROUTES TAB
 // ════════════════════════════════════════════════════════════════════════════
 class _RoutesTab extends StatelessWidget {
   final Stream<QuerySnapshot> stream;
@@ -2093,16 +2453,15 @@ class _RoutesTab extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PROFILE TAB (unchanged)
+//  PROFILE TAB
 // ════════════════════════════════════════════════════════════════════════════
 class _ProfileTab extends StatelessWidget {
   final User? user;
-  final bool kycVerified, locationGranted;
+  final bool kycVerified;
   final VoidCallback onSetupTap, onSignOut, onSwitchSender;
   const _ProfileTab({
     required this.user,
     required this.kycVerified,
-    required this.locationGranted,
     required this.onSetupTap,
     required this.onSignOut,
     required this.onSwitchSender,
@@ -2159,18 +2518,9 @@ class _ProfileTab extends StatelessWidget {
                       style: const TextStyle(fontSize: 12, color: _text2),
                     ),
                     const SizedBox(height: 8),
-                    Row(
-                      children: [
-                        _PBadge(
-                          label: kycVerified ? '✅ KYC Done' : '⚠️ KYC Pending',
-                          color: kycVerified ? _green : _orange,
-                        ),
-                        const SizedBox(width: 6),
-                        _PBadge(
-                          label: locationGranted ? '📍 GPS On' : '📍 GPS Off',
-                          color: locationGranted ? _teal : _red,
-                        ),
-                      ],
+                    _PBadge(
+                      label: kycVerified ? '✅ Verified' : '⏳ KYC Pending',
+                      color: kycVerified ? _green : _orange,
                     ),
                   ],
                 ),
@@ -2189,13 +2539,7 @@ class _ProfileTab extends StatelessWidget {
           child: Column(
             children: [
               _CheckRow(
-                label: 'Location Access',
-                done: locationGranted,
-                onTap: onSetupTap,
-              ),
-              const Divider(color: Color(0xFFF1F5F9), height: 1),
-              _CheckRow(
-                label: 'KYC Document Uploaded',
+                label: 'KYC Status',
                 done: kycVerified,
                 onTap: onSetupTap,
               ),
@@ -2342,79 +2686,6 @@ class _PickerField extends StatelessWidget {
   );
 }
 
-class _SetupBanner extends StatelessWidget {
-  final bool locationGranted, kycVerified;
-  final VoidCallback onTap;
-  const _SetupBanner({
-    required this.locationGranted,
-    required this.kycVerified,
-    required this.onTap,
-  });
-  @override
-  Widget build(BuildContext context) {
-    final steps = [
-      if (!locationGranted) '📍 Allow Location',
-      if (!kycVerified) '🪪 Upload KYC',
-    ];
-    return GestureDetector(
-      onTap: onTap,
-      child: Container(
-        padding: const EdgeInsets.all(14),
-        decoration: BoxDecoration(
-          gradient: const LinearGradient(
-            colors: [Color(0xFFFFF7ED), Color(0xFFFFEDD5)],
-          ),
-          borderRadius: BorderRadius.circular(16),
-          border: Border.all(color: _orange.withOpacity(0.3)),
-        ),
-        child: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: _orange.withOpacity(0.15),
-                shape: BoxShape.circle,
-              ),
-              child: const Icon(
-                Icons.lock_outline_rounded,
-                color: _orange,
-                size: 20,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Column(
-                crossAxisAlignment: CrossAxisAlignment.start,
-                children: [
-                  const Text(
-                    'Complete setup to accept parcels',
-                    style: TextStyle(
-                      fontSize: 13,
-                      fontWeight: FontWeight.bold,
-                      color: Color(0xFF92400E),
-                    ),
-                  ),
-                  const SizedBox(height: 2),
-                  Text(
-                    steps.join('  •  '),
-                    style: const TextStyle(fontSize: 11, color: _orange),
-                  ),
-                ],
-              ),
-            ),
-            const Icon(
-              Icons.arrow_forward_ios_rounded,
-              size: 12,
-              color: _orange,
-            ),
-          ],
-        ),
-      ),
-    );
-  }
-}
-
 class _AddRouteCard extends StatelessWidget {
   final VoidCallback onTap;
   const _AddRouteCard({required this.onTap});
@@ -2494,21 +2765,27 @@ class _AddRouteCard extends StatelessWidget {
 }
 
 class _EarningCard extends StatelessWidget {
-  final Stream<QuerySnapshot> stream;
-  const _EarningCard({required this.stream});
+  final String userId;
+  const _EarningCard({required this.userId});
   @override
-  Widget build(BuildContext context) => StreamBuilder<QuerySnapshot>(
-    stream: stream,
+  Widget build(BuildContext context) => StreamBuilder<DocumentSnapshot>(
+    stream: FirebaseFirestore.instance
+        .collection('wallets')
+        .doc(userId)
+        .snapshots(),
     builder: (_, snap) {
-      double total = 0, weekly = 0;
-      final now = DateTime.now();
-      for (final doc in snap.data?.docs ?? []) {
-        final d = doc.data() as Map<String, dynamic>;
-        final p = (d['price'] as num?)?.toDouble() ?? 0;
-        total += p;
-        final ts = d['createdAt'] as Timestamp?;
-        if (ts != null && now.difference(ts.toDate()).inDays <= 7) weekly += p;
+      double total = 0;
+      double balance = 0;
+      double withdrawn = 0;
+
+      if (snap.hasData && snap.data!.exists) {
+        final data = snap.data!.data() as Map<String, dynamic>;
+
+        total = (data['totalEarnings'] ?? 0).toDouble();
+        balance = (data['balance'] ?? 0).toDouble();
+        withdrawn = (data['totalWithdrawn'] ?? 0).toDouble();
       }
+
       return Container(
         padding: const EdgeInsets.all(18),
         decoration: BoxDecoration(
@@ -2567,18 +2844,18 @@ class _EarningCard extends StatelessWidget {
                 Container(width: 1, height: 56, color: const Color(0xFFF1F5F9)),
                 Expanded(
                   child: _ETile(
-                    label: 'This Week',
-                    value: '₹${weekly.toStringAsFixed(0)}',
-                    icon: Icons.trending_up_rounded,
+                    label: 'Wallet Balance',
+                    value: '₹${balance.toStringAsFixed(0)}',
+                    icon: Icons.account_balance_wallet,
                     color: _teal,
                   ),
                 ),
                 Container(width: 1, height: 56, color: const Color(0xFFF1F5F9)),
                 Expanded(
                   child: _ETile(
-                    label: 'Deliveries',
-                    value: '${snap.data?.docs.length ?? 0}',
-                    icon: Icons.local_shipping_outlined,
+                    label: 'Withdrawn',
+                    value: '₹${withdrawn.toStringAsFixed(0)}',
+                    icon: Icons.payments_outlined,
                     color: _orange,
                   ),
                 ),
@@ -2788,91 +3065,6 @@ class _ActiveTile extends StatelessWidget {
   }
 }
 
-// ── Small reusable widgets ────────────────────────────────────────────────────
-class _StepTile extends StatelessWidget {
-  final String stepNum, title, subtitle, buttonLabel;
-  final IconData icon;
-  final Color color;
-  final bool done;
-  final Future<void> Function()? onTap;
-  const _StepTile({
-    required this.stepNum,
-    required this.icon,
-    required this.color,
-    required this.title,
-    required this.subtitle,
-    required this.done,
-    required this.buttonLabel,
-    this.onTap,
-  });
-  @override
-  Widget build(BuildContext context) => Container(
-    padding: const EdgeInsets.all(14),
-    decoration: BoxDecoration(
-      color: done ? _green.withOpacity(0.04) : color.withOpacity(0.04),
-      borderRadius: BorderRadius.circular(14),
-      border: Border.all(
-        color: done ? _green.withOpacity(0.25) : color.withOpacity(0.2),
-      ),
-    ),
-    child: Row(
-      children: [
-        _StepCircle(num: stepNum, done: done),
-        const SizedBox(width: 10),
-        Container(
-          width: 36,
-          height: 36,
-          decoration: BoxDecoration(
-            color: (done ? _green : color).withOpacity(0.1),
-            borderRadius: BorderRadius.circular(10),
-          ),
-          child: Icon(
-            done ? Icons.check_circle_rounded : icon,
-            color: done ? _green : color,
-            size: 18,
-          ),
-        ),
-        const SizedBox(width: 10),
-        Expanded(
-          child: Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(
-                title,
-                style: TextStyle(
-                  fontSize: 13,
-                  fontWeight: FontWeight.bold,
-                  color: done ? _green : _text1,
-                ),
-              ),
-              Text(
-                subtitle,
-                style: const TextStyle(fontSize: 11, color: _text2),
-              ),
-            ],
-          ),
-        ),
-        if (!done && onTap != null)
-          TextButton(
-            onPressed: onTap,
-            style: TextButton.styleFrom(
-              foregroundColor: color,
-              padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(8),
-                side: BorderSide(color: color.withOpacity(0.4)),
-              ),
-            ),
-            child: Text(
-              buttonLabel,
-              style: const TextStyle(fontSize: 11, fontWeight: FontWeight.w600),
-            ),
-          ),
-      ],
-    ),
-  );
-}
-
 class _Handle extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Container(
@@ -2881,33 +3073,6 @@ class _Handle extends StatelessWidget {
     decoration: BoxDecoration(
       color: Colors.grey[300],
       borderRadius: BorderRadius.circular(4),
-    ),
-  );
-}
-
-class _StepCircle extends StatelessWidget {
-  final String num;
-  final bool done;
-  const _StepCircle({required this.num, required this.done});
-  @override
-  Widget build(BuildContext context) => Container(
-    width: 24,
-    height: 24,
-    decoration: BoxDecoration(
-      color: done ? _green : _indigo,
-      shape: BoxShape.circle,
-    ),
-    child: Center(
-      child: done
-          ? const Icon(Icons.check, size: 13, color: Colors.white)
-          : Text(
-              num,
-              style: const TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
-              ),
-            ),
     ),
   );
 }
@@ -3148,26 +3313,6 @@ class _MenuTile extends StatelessWidget {
   );
 }
 
-class _WStat extends StatelessWidget {
-  final String label, value;
-  const _WStat({required this.label, required this.value});
-  @override
-  Widget build(BuildContext context) => Column(
-    crossAxisAlignment: CrossAxisAlignment.start,
-    children: [
-      Text(
-        value,
-        style: const TextStyle(
-          fontSize: 18,
-          fontWeight: FontWeight.bold,
-          color: Colors.white,
-        ),
-      ),
-      Text(label, style: const TextStyle(fontSize: 11, color: Colors.white70)),
-    ],
-  );
-}
-
 class _SourceCard extends StatelessWidget {
   final IconData icon;
   final String label;
@@ -3230,7 +3375,8 @@ class _PrimaryBtn extends StatelessWidget {
 }
 
 class _SheetDropdown extends StatelessWidget {
-  final String label, value;
+  final String label;
+  final String? value;
   final List<String> items;
   final void Function(String?) onChanged;
   const _SheetDropdown({
@@ -3320,4 +3466,70 @@ class _SheetField extends StatelessWidget {
       contentPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 13),
     ),
   );
+}
+
+class AddressAutocompleteField extends StatelessWidget {
+  final TextEditingController controller;
+  final String city;
+  final String area;
+  final String hintText;
+  final IconData prefixIcon;
+  final Function(String, double, double) onSelected;
+
+  const AddressAutocompleteField({
+    super.key,
+    required this.controller,
+    required this.city,
+    required this.area,
+    required this.onSelected,
+    this.hintText = "Search address",
+    this.prefixIcon = Icons.search,
+  });
+
+  Future<List<dynamic>> _search(String query) async {
+    final url = Uri.parse(
+      "https://nominatim.openstreetmap.org/search"
+      "?q=${Uri.encodeComponent("$query $area $city")}"
+      "&format=json"
+      "&limit=5"
+      '&countrycodes=in',
+    );
+
+    final res = await http.get(url, headers: {'User-Agent': 'SaarthiApp'});
+    return jsonDecode(res.body);
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    return TypeAheadField(
+      controller: controller,
+      builder: (context, controller, focusNode) {
+        return TextField(
+          controller: controller,
+          focusNode: focusNode,
+          decoration: InputDecoration(
+            hintText: hintText,
+            prefixIcon: Icon(prefixIcon),
+          ),
+        );
+      },
+      suggestionsCallback: (pattern) async {
+        return await _search(pattern);
+      },
+      itemBuilder: (context, suggestion) {
+        return ListTile(
+          leading: const Icon(Icons.place),
+          title: Text(suggestion["display_name"]),
+        );
+      },
+      onSelected: (suggestion) {
+        controller.text = suggestion["display_name"];
+        onSelected(
+          suggestion["display_name"],
+          double.parse(suggestion["lat"]),
+          double.parse(suggestion["lon"]),
+        );
+      },
+    );
+  }
 }

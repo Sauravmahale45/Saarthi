@@ -1,6 +1,3 @@
-// lib/features/tracking/parcel_tracking_screen.dart
-// Corrected version with reliable polyline, distance/ETA, and no rebuild loops
-
 import 'dart:async';
 import 'dart:convert';
 import 'dart:math' as math;
@@ -11,30 +8,40 @@ import 'package:flutter_map/flutter_map.dart';
 import 'package:http/http.dart' as http;
 import 'package:latlong2/latlong.dart';
 
-// ── Brand colours ──────────────────────────────────────────────────────────
-const _indigo = Color(0xFF4F46E5);
-const _teal = Color(0xFF14B8A6);
-const _orange = Color(0xFFF97316);
-const _green = Color(0xFF22C55E);
-const _red = Color(0xFFEF4444);
-const _bg = Color(0xFFF5F7FF);
+// ── Brand / UI colours ─────────────────────────────────────────────────────
+const _blue = Color(0xFF2D7DF6); // Uber-style route blue
+const _green = Color(0xFF22C55E); // destination marker
+const _orange = Color(0xFFF97316); // warnings / fallback
+const _bg = Color(0xFFF0F4FF);
+const _surface = Colors.white;
 const _text1 = Color(0xFF0F172A);
 const _text2 = Color(0xFF64748B);
+const _text3 = Color(0xFF94A3B8);
 
+// ── Route polyline constants ────────────────────────────────────────────────
+const _routeShadowColor = Color(0x26000000); // black 15%
+const _routeBorderColor = Colors.white;
+const _routeMainColor = _blue;
+
+// ════════════════════════════════════════════════════════════════════════════
+//  SCREEN
+// ════════════════════════════════════════════════════════════════════════════
 class ParcelTrackingScreen extends StatefulWidget {
   final String parcelId;
-  final double destLat;
-  final double destLng;
-  final String destLabel;
-  final String travelerName;
+
+  // Optional: pass these directly to skip the parcels/{id} Firestore fetch.
+  final double? destLat;
+  final double? destLng;
+  final String? destLabel;
+  final String? travelerName;
 
   const ParcelTrackingScreen({
     super.key,
     required this.parcelId,
-    required this.destLat,
-    required this.destLng,
-    required this.destLabel,
-    required this.travelerName,
+    this.destLat,
+    this.destLng,
+    this.destLabel,
+    this.travelerName,
   });
 
   @override
@@ -42,71 +49,151 @@ class ParcelTrackingScreen extends StatefulWidget {
 }
 
 class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
-    with SingleTickerProviderStateMixin {
+    with TickerProviderStateMixin {
+  // ── Controllers ────────────────────────────────────────────────────────────
   final MapController _mapController = MapController();
 
-  // Firestore subscription (replaces StreamBuilder)
-  StreamSubscription<DocumentSnapshot>? _locationSubscription;
+  // Marker animation (lerp between GPS positions)
+  late AnimationController _moveCtrl;
+  late Animation<double> _moveTween;
 
-  // State variables
-  LatLng? _travelerPos;
-  double? _travelerHeading;
-  List<LatLng> _routePoints = [];
-  double _distanceKm = 0;
-  double _speedKmh = 0;
-  int _etaMinutes = 0;
-  bool _fetchingRoute = false;
-  bool _routeError = false;
-  String _statusText = 'Locating traveler…';
-
-  // For change detection – store last processed position
-  LatLng? _lastProcessedPos;
-
-  Timer? _routeDebounce;
+  // Pulse animation for the traveler dot
   late AnimationController _pulseCtrl;
   late Animation<double> _pulse;
 
-  late final LatLng _dest = LatLng(widget.destLat, widget.destLng);
+  // ── Firestore subscriptions ────────────────────────────────────────────────
+  StreamSubscription<DocumentSnapshot>? _locationSub;
+  StreamSubscription<DocumentSnapshot>? _parcelSub;
 
+  // ── Route / position state ─────────────────────────────────────────────────
+  LatLng? _travelerPos; // animated current position
+  LatLng? _prevPos; // position at start of lerp
+  LatLng? _targetPos; // position at end of lerp
+  double? _heading;
+  double _speedKmh = 0;
+
+  LatLng? _dest;
+  String _destLabel = '';
+  String _travelerName = '';
+
+  List<LatLng> _routePoints = [];
+  double _distanceKm = 0;
+  int _etaMinutes = 0;
+
+  bool _fetchingRoute = false;
+  bool _routeError = false;
+  bool _cameraFitDone = false; // fit-to-bounds only on first route load
+
+  String _statusText = 'Locating traveler…';
+
+  Timer? _routeDebounce;
+
+  // ── Last processed position (for epsilon dedup) ────────────────────────────
+  LatLng? _lastProcessedPos;
+
+  // ── Distance bubble visibility ─────────────────────────────────────────────
+  bool _showDistanceBubble = false;
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  LIFECYCLE
+  // ════════════════════════════════════════════════════════════════════════════
   @override
   void initState() {
     super.initState();
+
+    // Smooth marker movement animation (600 ms)
+    _moveCtrl = AnimationController(
+      vsync: this,
+      duration: const Duration(milliseconds: 600),
+    );
+    _moveTween = CurvedAnimation(parent: _moveCtrl, curve: Curves.easeInOut);
+    _moveCtrl.addListener(_onMoveAnimTick);
+
+    // Pulse animation for glowing ring around traveler
     _pulseCtrl = AnimationController(
       vsync: this,
-      duration: const Duration(milliseconds: 1200),
+      duration: const Duration(milliseconds: 1400),
     )..repeat(reverse: true);
     _pulse = Tween<double>(
-      begin: 0.85,
-      end: 1.15,
+      begin: 0.82,
+      end: 1.18,
     ).animate(CurvedAnimation(parent: _pulseCtrl, curve: Curves.easeInOut));
 
-    // Set up Firestore listener
-    _locationSubscription = FirebaseFirestore.instance
-        .collection('locations')
-        .doc(widget.parcelId)
-        .snapshots()
-        .listen(
-          (snapshot) {
-            if (snapshot.exists && snapshot.data() != null) {
-              _onLocationUpdate(snapshot.data()! as Map<String, dynamic>);
-            }
-          },
-          onError: (error) {
-            debugPrint('Location stream error: $error');
-          },
-        );
+    // Seed from widget props (skip Firestore parcel fetch if already provided)
+    if (widget.destLat != null && widget.destLng != null) {
+      _dest = LatLng(widget.destLat!, widget.destLng!);
+      _destLabel = widget.destLabel ?? '';
+      _travelerName = widget.travelerName ?? 'Traveler';
+    } else {
+      _subscribeToParcel();
+    }
+
+    _subscribeToLocation();
   }
 
   @override
   void dispose() {
+    _moveCtrl.removeListener(_onMoveAnimTick);
+    _moveCtrl.dispose();
     _pulseCtrl.dispose();
     _routeDebounce?.cancel();
-    _locationSubscription?.cancel(); // Clean up subscription
+    _locationSub?.cancel();
+    _parcelSub?.cancel();
     super.dispose();
   }
 
-  /// Called whenever a new location document arrives.
-  /// Only proceeds if the coordinates have actually changed.
+  // ════════════════════════════════════════════════════════════════════════════
+  //  FIRESTORE SUBSCRIPTIONS
+  // ════════════════════════════════════════════════════════════════════════════
+
+  void _subscribeToParcel() {
+    _parcelSub = FirebaseFirestore.instance
+        .collection('parcels')
+        .doc(widget.parcelId)
+        .snapshots()
+        .listen(
+          (snap) {
+            if (!snap.exists || snap.data() == null) return;
+            final d = snap.data()!;
+            final drop = d['drop'] as Map<String, dynamic>?;
+            if (drop == null) return;
+
+            final lat = (drop['lat'] as num?)?.toDouble();
+            final lng = (drop['lng'] as num?)?.toDouble();
+            final address = (drop['address'] as String?) ?? '';
+
+            if (lat != null && lng != null && mounted) {
+              setState(() {
+                _dest = LatLng(lat, lng);
+                _destLabel = address;
+                _travelerName = (d['travelerName'] as String?) ?? 'Traveler';
+              });
+            }
+          },
+          onError: (e) =>
+              debugPrint('ParcelTrackingScreen: parcel sub error – $e'),
+        );
+  }
+
+  void _subscribeToLocation() {
+    _locationSub = FirebaseFirestore.instance
+        .collection('locations')
+        .doc(widget.parcelId)
+        .snapshots()
+        .listen(
+          (snap) {
+            if (!snap.exists || snap.data() == null) return;
+            _onLocationUpdate(snap.data()! as Map<String, dynamic>);
+          },
+          onError: (e) =>
+              debugPrint('ParcelTrackingScreen: location sub error – $e'),
+        );
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  LOCATION UPDATE HANDLER
+  // ════════════════════════════════════════════════════════════════════════════
+
   void _onLocationUpdate(Map<String, dynamic> data) {
     final lat = (data['latitude'] as num?)?.toDouble();
     final lng = (data['longitude'] as num?)?.toDouble();
@@ -117,7 +204,7 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
 
     final newPos = LatLng(lat, lng);
 
-    // Ignore if coordinates are essentially the same (epsilon ~11m)
+    // Skip if coordinates are essentially unchanged (~11 m epsilon)
     if (_lastProcessedPos != null) {
       const epsilon = 0.0001;
       if ((newPos.latitude - _lastProcessedPos!.latitude).abs() < epsilon &&
@@ -126,43 +213,70 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
       }
     }
 
-    // Update state with new data
-    setState(() {
-      _travelerPos = newPos;
-      _travelerHeading = heading;
-      _speedKmh = speed * 3.6;
-      _statusText = 'Parcel is on the way';
-      _lastProcessedPos = newPos;
-    });
+    _lastProcessedPos = newPos;
 
-    // Move map camera to new position (using move, not animate)
-    _mapController.move(newPos, _mapController.camera.zoom);
+    // Start interpolation animation from current rendered pos → new pos
+    _prevPos = _travelerPos ?? newPos;
+    _targetPos = newPos;
+    _moveCtrl
+      ..reset()
+      ..forward();
 
-    // Debounce route fetch: wait 1.5s after last movement
+    if (mounted) {
+      setState(() {
+        _heading = heading;
+        _speedKmh = speed * 3.6;
+        _statusText = 'Parcel is on the way';
+      });
+    }
+
+    // Debounce route fetch: 1.5 s after last position update
     _routeDebounce?.cancel();
     _routeDebounce = Timer(const Duration(milliseconds: 1500), () {
-      _fetchRoute(newPos);
+      if (_dest != null) _fetchRoute(newPos, _dest!);
     });
   }
 
-  Future<void> _fetchRoute(LatLng from) async {
-    if (_fetchingRoute) return;
+  // Lerp tick: rebuild map with interpolated marker position
+  void _onMoveAnimTick() {
+    if (_prevPos == null || _targetPos == null) return;
+    final t = _moveTween.value;
+    final lerped = LatLng(
+      _prevPos!.latitude + (_targetPos!.latitude - _prevPos!.latitude) * t,
+      _prevPos!.longitude + (_targetPos!.longitude - _prevPos!.longitude) * t,
+    );
+    if (mounted) {
+      setState(() => _travelerPos = lerped);
+    }
+    // Follow the traveler smoothly with the camera
+    if (_cameraFitDone) {
+      _mapController.move(lerped, _mapController.camera.zoom);
+    }
+  }
 
-    setState(() {
-      _fetchingRoute = true;
-      _routeError = false;
-    });
+  // ════════════════════════════════════════════════════════════════════════════
+  //  ROUTE FETCH (OSRM)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  Future<void> _fetchRoute(LatLng from, LatLng to) async {
+    if (_fetchingRoute) return;
+    if (mounted)
+      setState(() {
+        _fetchingRoute = true;
+        _routeError = false;
+      });
 
     try {
-      // OSRM public server
       final url = Uri.parse(
         'https://router.project-osrm.org/route/v1/driving/'
         '${from.longitude},${from.latitude};'
-        '${_dest.longitude},${_dest.latitude}'
+        '${to.longitude},${to.latitude}'
         '?overview=full&geometries=geojson',
       );
 
-      final response = await http.get(url).timeout(const Duration(seconds: 10));
+      final response = await http
+          .get(url, headers: {'Accept': 'application/json'})
+          .timeout(const Duration(seconds: 12));
 
       if (response.statusCode != 200) {
         throw Exception('OSRM status ${response.statusCode}');
@@ -170,41 +284,87 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
 
       final body = jsonDecode(response.body) as Map<String, dynamic>;
       final routes = body['routes'] as List<dynamic>;
-
-      if (routes.isEmpty) {
-        throw Exception('No routes found');
-      }
+      if (routes.isEmpty) throw Exception('No routes returned');
 
       final route = routes[0] as Map<String, dynamic>;
       final geometry = route['geometry'] as Map<String, dynamic>;
       final coords = geometry['coordinates'] as List<dynamic>;
 
       final points = coords
-          .map((c) => LatLng((c as List)[1] as double, (c)[0] as double))
+          .map((c) => LatLng((c as List)[1] as double, c[0] as double))
           .toList();
 
-      final distanceM = (route['distance'] as num?)?.toDouble() ?? 0;
-      final durationS = (route['duration'] as num?)?.toDouble() ?? 0;
+      final distanceM = (route['distance'] as num).toDouble();
+      final durationS = (route['duration'] as num).toDouble();
 
-      setState(() {
-        _routePoints = points;
-        _distanceKm = distanceM / 1000;
-        _etaMinutes = (durationS / 60).ceil();
-        _fetchingRoute = false;
-      });
+      if (mounted) {
+        setState(() {
+          _routePoints = points;
+          _distanceKm = distanceM / 1000;
+          _etaMinutes = (durationS / 60).ceil();
+          _fetchingRoute = false;
+          _showDistanceBubble = true;
+        });
+
+        // Fit camera to full route on first successful load
+        if (!_cameraFitDone && points.length >= 2) {
+          _fitCameraToRoute(points);
+          _cameraFitDone = true;
+        }
+      }
     } catch (e) {
-      debugPrint('Route fetch failed: $e – using straight line fallback');
-      // Fallback: straight line between traveler and destination
-      setState(() {
-        _routePoints = [from, _dest]; // ensures at least two points
-        _routeError = true;
-        _fetchingRoute = false;
-        _distanceKm = _haversineKm(from, _dest);
-        // Assume average speed 30 km/h for ETA estimate
-        _etaMinutes = (_distanceKm / 30 * 60).ceil();
-      });
+      debugPrint(
+        'ParcelTrackingScreen: route fetch failed – $e (straight-line fallback)',
+      );
+      if (mounted) {
+        setState(() {
+          _routePoints = [from, to];
+          _routeError = true;
+          _fetchingRoute = false;
+          _distanceKm = _haversineKm(from, to);
+          _etaMinutes = (_distanceKm / 30 * 60).ceil();
+          _showDistanceBubble = true;
+        });
+        if (!_cameraFitDone) {
+          _fitCameraToRoute([from, to]);
+          _cameraFitDone = true;
+        }
+      }
     }
   }
+
+  void _fitCameraToRoute(List<LatLng> points) {
+    if (points.isEmpty) return;
+    var minLat = points.first.latitude;
+    var maxLat = points.first.latitude;
+    var minLng = points.first.longitude;
+    var maxLng = points.first.longitude;
+
+    for (final p in points) {
+      if (p.latitude < minLat) minLat = p.latitude;
+      if (p.latitude > maxLat) maxLat = p.latitude;
+      if (p.longitude < minLng) minLng = p.longitude;
+      if (p.longitude > maxLng) maxLng = p.longitude;
+    }
+
+    final bounds = LatLngBounds(LatLng(minLat, minLng), LatLng(maxLat, maxLng));
+
+    // Delay one frame so the map is ready
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      try {
+        _mapController.fitCamera(
+          CameraFit.bounds(
+            bounds: bounds,
+            padding: const EdgeInsets.fromLTRB(48, 140, 48, 280),
+          ),
+        );
+      } catch (_) {}
+    });
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  HELPERS
+  // ════════════════════════════════════════════════════════════════════════════
 
   double _haversineKm(LatLng a, LatLng b) {
     const r = 6371.0;
@@ -221,31 +381,56 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
 
   double _deg2rad(double deg) => deg * math.pi / 180;
 
+  String get _shortParcelId {
+    final id = widget.parcelId;
+    return id.length > 8
+        ? '${id.substring(0, 8).toUpperCase()}…'
+        : id.toUpperCase();
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  BUILD
+  // ════════════════════════════════════════════════════════════════════════════
+
   @override
   Widget build(BuildContext context) {
-    // No StreamBuilder – just use current state
     return Scaffold(
       backgroundColor: _bg,
       body: Stack(
         children: [
           _buildMap(),
           _buildTopBar(context),
+          if (_showDistanceBubble)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 74,
+              left: 0,
+              right: 0,
+              child: Center(child: _buildDistanceBubble()),
+            ),
+          if (_fetchingRoute && _travelerPos != null)
+            Positioned(
+              top: MediaQuery.of(context).padding.top + 74,
+              right: 16,
+              child: _buildRouteLoadingPill(),
+            ),
           Positioned(
-            top: 110,
             left: 0,
             right: 0,
-            child: Center(child: _buildStatusChip()),
+            bottom: 0,
+            child: _buildBottomInfoCard(),
           ),
-          Positioned(left: 0, right: 0, bottom: 0, child: _buildBottomCard()),
-          if (_fetchingRoute && _travelerPos != null)
-            Positioned(top: 150, right: 20, child: _buildRouteLoadingPill()),
         ],
       ),
     );
   }
 
+  // ════════════════════════════════════════════════════════════════════════════
+  //  MAP
+  // ════════════════════════════════════════════════════════════════════════════
+
   Widget _buildMap() {
-    final initialCenter = _travelerPos ?? _dest;
+    final initialCenter =
+        _travelerPos ?? _dest ?? const LatLng(20.5937, 78.9629);
 
     return FlutterMap(
       mapController: _mapController,
@@ -253,71 +438,113 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
         initialCenter: initialCenter,
         initialZoom: 14.0,
         minZoom: 4,
-        maxZoom: 18,
+        maxZoom: 19,
         interactionOptions: const InteractionOptions(
           flags: InteractiveFlag.all,
         ),
       ),
       children: [
-        // CartoDB Voyager tiles (free, clean)
+        // CartoDB Voyager tiles
         TileLayer(
           urlTemplate:
-              'https://{s}.basemaps.cartocdn.com/light_all/{z}/{x}/{y}{r}.png',
-          subdomains: const ['a', 'b', 'c'],
+              'https://{s}.basemaps.cartocdn.com/rastertiles/voyager/{z}/{x}/{y}{r}.png',
+          subdomains: const ['a', 'b', 'c', 'd'],
           userAgentPackageName: 'com.saarthi.app',
-          maxZoom: 18,
+          maxZoom: 19,
+          retinaMode: RetinaMode.isHighDensity(context),
         ),
 
-        // Route polyline
-        if (_routePoints.length >= 2)
-          PolylineLayer(
-            polylines: [
-              Polyline(
-                points: _routePoints,
-                color: _indigo,
-                strokeWidth: 5,
-                borderColor: Colors.white,
-                borderStrokeWidth: 2,
-              ),
-            ],
-          ),
+        // Route polylines (shadow → border → main)
+        _buildRouteLayer(),
 
         // Markers
-        MarkerLayer(
-          markers: [
-            Marker(
-              point: _dest,
-              width: 50,
-              height: 60,
-              child: _DestinationMarker(label: widget.destLabel),
-            ),
-            if (_travelerPos != null)
-              Marker(
-                point: _travelerPos!,
-                width: 70,
-                height: 70,
-                child: AnimatedBuilder(
-                  animation: _pulse,
-                  builder: (_, __) => _TravelerMarker(
-                    scale: _pulse.value,
-                    name: widget.travelerName,
-                    speedKmh: _speedKmh,
-                    heading: _travelerHeading,
-                  ),
-                ),
-              ),
-          ],
-        ),
+        _buildMarkers(),
 
-        // Attribution (required for tile license)
+        // OSM attribution (required by tile license)
         RichAttributionWidget(
+          alignment: AttributionAlignment.bottomLeft,
           attributions: [
             TextSourceAttribution('OpenStreetMap contributors', onTap: () {}),
+            TextSourceAttribution('© CARTO', onTap: () {}),
           ],
         ),
       ],
     );
   }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  ROUTE LAYER  (three-pass: shadow → border → main colour)
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Widget _buildRouteLayer() {
+    if (_routePoints.length < 2) return const SizedBox.shrink();
+
+    return PolylineLayer(
+      polylines: [
+        // 1. Shadow
+        Polyline(
+          points: _routePoints,
+          color: _routeShadowColor,
+          strokeWidth: 10,
+        ),
+        // 2. White border
+        Polyline(
+          points: _routePoints,
+          color: _routeBorderColor,
+          strokeWidth: 7,
+        ),
+        // 3. Main route
+        Polyline(points: _routePoints, color: _routeMainColor, strokeWidth: 4),
+      ],
+    );
+  }
+
+  // ────────────────────────────────────────────────────────────────────────────
+  //  MARKERS
+  // ────────────────────────────────────────────────────────────────────────────
+
+  Widget _buildMarkers() {
+    final markers = <Marker>[];
+
+    // Destination marker
+    if (_dest != null) {
+      markers.add(
+        Marker(
+          point: _dest!,
+          width: 56,
+          height: 70,
+          child: _DestinationMarker(
+            label: _destLabel.isEmpty ? 'Drop' : _destLabel,
+          ),
+        ),
+      );
+    }
+
+    // Traveler marker with animation
+    if (_travelerPos != null) {
+      markers.add(
+        Marker(
+          point: _travelerPos!,
+          width: 80,
+          height: 80,
+          child: AnimatedBuilder(
+            animation: _pulse,
+            builder: (_, __) => _TravelerMarker(
+              pulseScale: _pulse.value,
+              heading: _heading,
+              name: _travelerName,
+            ),
+          ),
+        ),
+      );
+    }
+
+    return MarkerLayer(markers: markers);
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  TOP BAR
+  // ════════════════════════════════════════════════════════════════════════════
 
   Widget _buildTopBar(BuildContext context) {
     return Positioned(
@@ -326,81 +553,71 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
       right: 0,
       child: Container(
         padding: EdgeInsets.only(
-          top: MediaQuery.of(context).padding.top + 8,
+          top: MediaQuery.of(context).padding.top + 10,
           left: 16,
           right: 16,
           bottom: 12,
         ),
-        decoration: BoxDecoration(
-          color: Colors.white,
+        decoration: const BoxDecoration(
+          color: _surface,
+          borderRadius: BorderRadius.vertical(bottom: Radius.circular(20)),
           boxShadow: [
             BoxShadow(
-              color: Colors.black.withOpacity(0.08),
-              blurRadius: 12,
-              offset: const Offset(0, 3),
+              color: Color(0x14000000),
+              blurRadius: 16,
+              offset: Offset(0, 4),
             ),
           ],
         ),
         child: Row(
           children: [
-            GestureDetector(
+            // Back button
+            _TopBarButton(
               onTap: () => Navigator.pop(context),
-              child: Container(
-                width: 38,
-                height: 38,
-                decoration: BoxDecoration(
-                  color: _bg,
-                  borderRadius: BorderRadius.circular(12),
-                  border: Border.all(color: const Color(0xFFE2E8F0)),
-                ),
-                child: const Icon(
-                  Icons.arrow_back_ios_new_rounded,
-                  size: 16,
-                  color: _text1,
-                ),
+              child: const Icon(
+                Icons.arrow_back_ios_new_rounded,
+                size: 16,
+                color: _text1,
               ),
             ),
             const SizedBox(width: 12),
+
+            // Title
             Expanded(
               child: Column(
                 crossAxisAlignment: CrossAxisAlignment.start,
+                mainAxisSize: MainAxisSize.min,
                 children: [
                   const Text(
                     'Live Tracking',
                     style: TextStyle(
-                      fontSize: 16,
-                      fontWeight: FontWeight.bold,
+                      fontSize: 15,
+                      fontWeight: FontWeight.w700,
                       color: _text1,
+                      letterSpacing: -0.3,
                     ),
                   ),
                   Text(
-                    'Parcel ${widget.parcelId.substring(0, 8)}…',
-                    style: const TextStyle(fontSize: 11, color: _text2),
+                    'Order $_shortParcelId',
+                    style: const TextStyle(fontSize: 11, color: _text3),
                   ),
                 ],
               ),
             ),
-            GestureDetector(
+
+            // Re-centre button
+            _TopBarButton(
+              color: _blue,
               onTap: () {
-                if (_travelerPos != null) {
-                  _mapController.move(
-                    _travelerPos!,
-                    _mapController.camera.zoom,
-                  );
+                final pos = _travelerPos;
+                if (pos != null) {
+                  _mapController.move(pos, _mapController.camera.zoom);
                 }
               },
-              child: Container(
-                width: 38,
-                height: 38,
-                decoration: BoxDecoration(
-                  color: _indigo,
-                  borderRadius: BorderRadius.circular(12),
-                ),
-                child: const Icon(
-                  Icons.my_location_rounded,
-                  size: 18,
-                  color: Colors.white,
-                ),
+              child: const Icon(
+                Icons.my_location_rounded,
+                size: 17,
+                color: Colors.white,
               ),
             ),
           ],
@@ -409,216 +626,71 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
     );
   }
 
-  Widget _buildStatusChip() {
-    final color = _travelerPos == null ? _orange : _green;
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 6),
-      decoration: BoxDecoration(
-        color: color.withOpacity(0.12),
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: color.withOpacity(0.35)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.08),
-            blurRadius: 8,
-            offset: const Offset(0, 2),
-          ),
-        ],
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Container(
-            width: 8,
-            height: 8,
-            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
-          ),
-          const SizedBox(width: 7),
-          Text(
-            _statusText,
-            style: TextStyle(
-              fontSize: 12,
-              fontWeight: FontWeight.w700,
-              color: color,
-            ),
-          ),
-        ],
-      ),
-    );
-  }
+  // ════════════════════════════════════════════════════════════════════════════
+  //  FLOATING DISTANCE BUBBLE
+  // ════════════════════════════════════════════════════════════════════════════
 
-  Widget _buildBottomCard() {
-    return Container(
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: const BorderRadius.vertical(top: Radius.circular(24)),
-        boxShadow: [
-          BoxShadow(
-            color: Colors.black.withOpacity(0.12),
-            blurRadius: 20,
-            offset: const Offset(0, -4),
-          ),
-        ],
-      ),
-      padding: const EdgeInsets.fromLTRB(20, 16, 20, 32),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          // Drag handle
-          Container(
-            width: 40,
-            height: 4,
-            decoration: BoxDecoration(
-              color: Colors.grey[300],
-              borderRadius: BorderRadius.circular(4),
-            ),
-          ),
-          const SizedBox(height: 16),
+  Widget _buildDistanceBubble() {
+    final distStr = _distanceKm > 0
+        ? '${_distanceKm.toStringAsFixed(1)} km'
+        : '—';
+    final etaStr = _etaMinutes > 0 ? '$_etaMinutes min away' : 'Calculating…';
 
-          // Traveler info row
-          Row(
-            children: [
-              Container(
-                width: 46,
-                height: 46,
-                decoration: BoxDecoration(
-                  color: _indigo.withOpacity(0.1),
-                  shape: BoxShape.circle,
-                ),
-                child: Center(
-                  child: Text(
-                    widget.travelerName.isNotEmpty
-                        ? widget.travelerName[0].toUpperCase()
-                        : 'T',
-                    style: const TextStyle(
-                      fontSize: 18,
-                      fontWeight: FontWeight.bold,
-                      color: _indigo,
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 12),
-              Expanded(
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Text(
-                      widget.travelerName,
-                      style: const TextStyle(
-                        fontSize: 15,
-                        fontWeight: FontWeight.bold,
-                        color: _text1,
-                      ),
-                    ),
-                    const Text(
-                      'Your delivery partner',
-                      style: TextStyle(fontSize: 12, color: _text2),
-                    ),
-                  ],
-                ),
-              ),
-              if (_travelerPos != null)
-                Container(
-                  padding: const EdgeInsets.symmetric(
-                    horizontal: 10,
-                    vertical: 5,
-                  ),
-                  decoration: BoxDecoration(
-                    color: _teal.withOpacity(0.1),
-                    borderRadius: BorderRadius.circular(10),
-                    border: Border.all(color: _teal.withOpacity(0.3)),
-                  ),
-                  child: Row(
-                    mainAxisSize: MainAxisSize.min,
-                    children: [
-                      const Icon(Icons.speed_rounded, size: 13, color: _teal),
-                      const SizedBox(width: 4),
-                      Text(
-                        '${_speedKmh.toStringAsFixed(0)} km/h',
-                        style: const TextStyle(
-                          fontSize: 11,
-                          fontWeight: FontWeight.w700,
-                          color: _teal,
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
-            ],
-          ),
-          const SizedBox(height: 16),
-
-          // ETA + Distance + Destination row
-          if (_travelerPos != null)
-            Row(
-              children: [
-                _InfoPill(
-                  icon: Icons.access_time_rounded,
-                  label: 'ETA',
-                  value: _etaMinutes > 0 ? '$_etaMinutes min' : 'Calculating…',
-                  color: _indigo,
-                ),
-                const SizedBox(width: 10),
-                _InfoPill(
-                  icon: Icons.route_rounded,
-                  label: 'Distance',
-                  value: _distanceKm > 0
-                      ? '${_distanceKm.toStringAsFixed(1)} km'
-                      : '—',
-                  color: _orange,
-                ),
-                const SizedBox(width: 10),
-                _InfoPill(
-                  icon: Icons.location_on_rounded,
-                  label: 'Destination',
-                  value: widget.destLabel,
-                  color: _green,
-                ),
-              ],
-            )
-          else
-            const _WaitingForTraveler(),
-
-          if (_routeError) ...[
-            const SizedBox(height: 10),
-            Container(
-              padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
-              decoration: BoxDecoration(
-                color: _orange.withOpacity(0.08),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: _orange.withOpacity(0.25)),
-              ),
-              child: Row(
-                children: const [
-                  Icon(Icons.warning_amber_rounded, size: 13, color: _orange),
-                  SizedBox(width: 6),
-                  Expanded(
-                    child: Text(
-                      'Using straight‑line estimate (road data unavailable)',
-                      style: TextStyle(fontSize: 11, color: _orange),
-                    ),
-                  ),
-                ],
-              ),
+    return AnimatedOpacity(
+      opacity: _showDistanceBubble ? 1.0 : 0.0,
+      duration: const Duration(milliseconds: 300),
+      child: Container(
+        padding: const EdgeInsets.symmetric(horizontal: 18, vertical: 9),
+        decoration: BoxDecoration(
+          color: _text1,
+          borderRadius: BorderRadius.circular(30),
+          boxShadow: [
+            BoxShadow(
+              color: _text1.withOpacity(0.25),
+              blurRadius: 16,
+              offset: const Offset(0, 4),
             ),
           ],
-        ],
+        ),
+        child: Row(
+          mainAxisSize: MainAxisSize.min,
+          children: [
+            const Icon(Icons.route_rounded, size: 14, color: Colors.white70),
+            const SizedBox(width: 7),
+            Text(
+              '$distStr  •  $etaStr',
+              style: const TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w600,
+                color: Colors.white,
+                letterSpacing: 0.1,
+              ),
+            ),
+            if (_routeError) ...[
+              const SizedBox(width: 6),
+              const Icon(Icons.warning_amber_rounded, size: 13, color: _orange),
+            ],
+          ],
+        ),
       ),
     );
   }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  ROUTE LOADING PILL
+  // ════════════════════════════════════════════════════════════════════════════
 
   Widget _buildRouteLoadingPill() {
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 7),
       decoration: BoxDecoration(
-        color: Colors.white,
+        color: _surface,
         borderRadius: BorderRadius.circular(20),
-        boxShadow: [
+        boxShadow: const [
           BoxShadow(
-            color: Colors.black.withOpacity(0.12),
-            blurRadius: 8,
-            offset: const Offset(0, 2),
+            color: Color(0x14000000),
+            blurRadius: 10,
+            offset: Offset(0, 2),
           ),
         ],
       ),
@@ -628,7 +700,7 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
           SizedBox(
             width: 12,
             height: 12,
-            child: CircularProgressIndicator(color: _indigo, strokeWidth: 2),
+            child: CircularProgressIndicator(color: _blue, strokeWidth: 2),
           ),
           SizedBox(width: 8),
           Text(
@@ -639,73 +711,256 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
       ),
     );
   }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  BOTTOM INFO CARD
+  // ════════════════════════════════════════════════════════════════════════════
+
+  Widget _buildBottomInfoCard() {
+    return Container(
+      decoration: const BoxDecoration(
+        color: _surface,
+        borderRadius: BorderRadius.vertical(top: Radius.circular(26)),
+        boxShadow: [
+          BoxShadow(
+            color: Color(0x1A000000),
+            blurRadius: 24,
+            offset: Offset(0, -6),
+          ),
+        ],
+      ),
+      child: SafeArea(
+        top: false,
+        child: Padding(
+          padding: const EdgeInsets.fromLTRB(20, 14, 20, 8),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Drag handle
+              Container(
+                width: 36,
+                height: 4,
+                decoration: BoxDecoration(
+                  color: const Color(0xFFE2E8F0),
+                  borderRadius: BorderRadius.circular(4),
+                ),
+              ),
+              const SizedBox(height: 18),
+
+              // Traveler row
+              _buildTravelerRow(),
+              const SizedBox(height: 16),
+
+              // Info pills or waiting state
+              if (_travelerPos != null)
+                _buildInfoPillRow()
+              else
+                const _WaitingTile(),
+
+              const SizedBox(height: 4),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+
+  Widget _buildTravelerRow() {
+    final initial = _travelerName.isNotEmpty
+        ? _travelerName[0].toUpperCase()
+        : 'T';
+    return Row(
+      children: [
+        // Avatar
+        Container(
+          width: 48,
+          height: 48,
+          decoration: BoxDecoration(
+            gradient: LinearGradient(
+              colors: [_blue.withOpacity(0.15), _blue.withOpacity(0.05)],
+              begin: Alignment.topLeft,
+              end: Alignment.bottomRight,
+            ),
+            shape: BoxShape.circle,
+            border: Border.all(color: _blue.withOpacity(0.2), width: 1.5),
+          ),
+          child: Center(
+            child: Text(
+              initial,
+              style: const TextStyle(
+                fontSize: 19,
+                fontWeight: FontWeight.w700,
+                color: _blue,
+              ),
+            ),
+          ),
+        ),
+        const SizedBox(width: 12),
+
+        // Name + subtitle
+        Expanded(
+          child: Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                _travelerName.isEmpty ? 'Your traveler' : _travelerName,
+                style: const TextStyle(
+                  fontSize: 15,
+                  fontWeight: FontWeight.w700,
+                  color: _text1,
+                  letterSpacing: -0.2,
+                ),
+              ),
+              const Text(
+                'Delivery partner',
+                style: TextStyle(fontSize: 12, color: _text2),
+              ),
+            ],
+          ),
+        ),
+
+        // Speed chip
+        if (_travelerPos != null) _SpeedChip(speedKmh: _speedKmh),
+
+        // Live indicator
+        const SizedBox(width: 8),
+        _LiveBadge(isLive: _travelerPos != null),
+      ],
+    );
+  }
+
+  Widget _buildInfoPillRow() {
+    return Row(
+      children: [
+        _InfoPill(
+          icon: Icons.access_time_rounded,
+          value: _etaMinutes > 0 ? '$_etaMinutes min' : '…',
+          label: 'ETA',
+          color: _blue,
+        ),
+        const SizedBox(width: 10),
+        _InfoPill(
+          icon: Icons.route_rounded,
+          value: _distanceKm > 0 ? '${_distanceKm.toStringAsFixed(1)} km' : '—',
+          label: 'Distance',
+          color: const Color(0xFF8B5CF6),
+        ),
+        const SizedBox(width: 10),
+        _InfoPill(
+          icon: Icons.location_on_rounded,
+          value: _destLabel.isEmpty
+              ? 'Drop'
+              : (_destLabel.length > 12
+                    ? '${_destLabel.substring(0, 12)}…'
+                    : _destLabel),
+          label: 'To',
+          color: _green,
+        ),
+      ],
+    );
+  }
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  TRAVELER MARKER (with rotation)
+//  TRAVELER MARKER  (rotation + pulse ring)
 // ════════════════════════════════════════════════════════════════════════════
 class _TravelerMarker extends StatelessWidget {
-  final double scale;
-  final String name;
-  final double speedKmh;
+  final double pulseScale;
   final double? heading;
+  final String name;
 
   const _TravelerMarker({
-    required this.scale,
+    required this.pulseScale,
     required this.name,
-    required this.speedKmh,
     this.heading,
   });
 
   @override
   Widget build(BuildContext context) {
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        Transform.scale(
-          scale: scale,
-          child: Transform.rotate(
-            angle: heading == null ? 0 : (heading! * math.pi / 180),
-            child: Container(
-              width: 46,
-              height: 46,
+    final angle = heading == null ? 0.0 : heading! * math.pi / 180;
+
+    return Center(
+      child: Column(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          SizedBox(
+            width: 64,
+            height: 64,
+            child: Stack(
+              alignment: Alignment.center,
+              children: [
+                // Pulsing outer ring
+                Transform.scale(
+                  scale: pulseScale,
+                  child: Container(
+                    width: 60,
+                    height: 60,
+                    decoration: BoxDecoration(
+                      shape: BoxShape.circle,
+                      color: _blue.withOpacity(0.12),
+                      border: Border.all(
+                        color: _blue.withOpacity(0.25),
+                        width: 1.5,
+                      ),
+                    ),
+                  ),
+                ),
+                // Icon with rotation
+                Transform.rotate(
+                  angle: angle,
+                  child: Container(
+                    width: 42,
+                    height: 42,
+                    decoration: BoxDecoration(
+                      color: _blue,
+                      shape: BoxShape.circle,
+                      border: Border.all(color: Colors.white, width: 3),
+                      boxShadow: [
+                        BoxShadow(
+                          color: _blue.withOpacity(0.45),
+                          blurRadius: 14,
+                          spreadRadius: 1,
+                        ),
+                      ],
+                    ),
+                    child: const Icon(
+                      Icons.delivery_dining_rounded,
+                      color: Colors.white,
+                      size: 20,
+                    ),
+                  ),
+                ),
+              ],
+            ),
+          ),
+          // Name label
+          if (name.isNotEmpty)
+            Container(
+              margin: const EdgeInsets.only(top: 2),
+              padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
               decoration: BoxDecoration(
-                color: _indigo,
-                shape: BoxShape.circle,
-                border: Border.all(color: Colors.white, width: 3),
+                color: _blue,
+                borderRadius: BorderRadius.circular(8),
                 boxShadow: [
                   BoxShadow(
-                    color: _indigo.withOpacity(0.45),
-                    blurRadius: 14,
-                    spreadRadius: 2,
+                    color: _blue.withOpacity(0.3),
+                    blurRadius: 6,
+                    offset: const Offset(0, 2),
                   ),
                 ],
               ),
-              child: const Icon(
-                Icons.delivery_dining_rounded,
-                color: Colors.white,
-                size: 22,
+              child: Text(
+                name.split(' ').first,
+                style: const TextStyle(
+                  color: Colors.white,
+                  fontSize: 9,
+                  fontWeight: FontWeight.w700,
+                  letterSpacing: 0.2,
+                ),
               ),
             ),
-          ),
-        ),
-        const SizedBox(height: 3),
-        Container(
-          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2),
-          decoration: BoxDecoration(
-            color: _indigo,
-            borderRadius: BorderRadius.circular(8),
-          ),
-          child: Text(
-            name.split(' ').first,
-            style: const TextStyle(
-              color: Colors.white,
-              fontSize: 9,
-              fontWeight: FontWeight.bold,
-            ),
-          ),
-        ),
-      ],
+        ],
+      ),
     );
   }
 }
@@ -719,21 +974,22 @@ class _DestinationMarker extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
+    final short = label.length > 12 ? '${label.substring(0, 12)}…' : label;
     return Column(
       mainAxisSize: MainAxisSize.min,
       children: [
         Container(
-          width: 40,
-          height: 40,
+          width: 42,
+          height: 42,
           decoration: BoxDecoration(
             color: _green,
             shape: BoxShape.circle,
             border: Border.all(color: Colors.white, width: 3),
             boxShadow: [
               BoxShadow(
-                color: _green.withOpacity(0.4),
-                blurRadius: 10,
-                spreadRadius: 2,
+                color: _green.withOpacity(0.45),
+                blurRadius: 12,
+                spreadRadius: 1,
               ),
             ],
           ),
@@ -741,17 +997,24 @@ class _DestinationMarker extends StatelessWidget {
         ),
         const SizedBox(height: 2),
         Container(
-          padding: const EdgeInsets.symmetric(horizontal: 6, vertical: 2),
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 2.5),
           decoration: BoxDecoration(
             color: _green,
-            borderRadius: BorderRadius.circular(7),
+            borderRadius: BorderRadius.circular(8),
+            boxShadow: [
+              BoxShadow(
+                color: _green.withOpacity(0.3),
+                blurRadius: 6,
+                offset: const Offset(0, 2),
+              ),
+            ],
           ),
           child: Text(
-            label.length > 10 ? '${label.substring(0, 10)}…' : label,
+            short,
             style: const TextStyle(
               color: Colors.white,
               fontSize: 9,
-              fontWeight: FontWeight.bold,
+              fontWeight: FontWeight.w700,
             ),
           ),
         ),
@@ -761,18 +1024,119 @@ class _DestinationMarker extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  INFO PILL
+//  SMALL WIDGETS
 // ════════════════════════════════════════════════════════════════════════════
+
+class _TopBarButton extends StatelessWidget {
+  final VoidCallback onTap;
+  final Widget child;
+  final Color color;
+
+  const _TopBarButton({
+    required this.onTap,
+    required this.child,
+    this.color = const Color(0xFFF1F5F9),
+  });
+
+  @override
+  Widget build(BuildContext context) {
+    return GestureDetector(
+      onTap: onTap,
+      child: Container(
+        width: 38,
+        height: 38,
+        decoration: BoxDecoration(
+          color: color,
+          borderRadius: BorderRadius.circular(12),
+          border: color == const Color(0xFFF1F5F9)
+              ? Border.all(color: const Color(0xFFE2E8F0))
+              : null,
+        ),
+        child: Center(child: child),
+      ),
+    );
+  }
+}
+
+class _LiveBadge extends StatelessWidget {
+  final bool isLive;
+  const _LiveBadge({required this.isLive});
+
+  @override
+  Widget build(BuildContext context) {
+    final color = isLive ? _green : _orange;
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
+      decoration: BoxDecoration(
+        color: color.withOpacity(0.1),
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: color.withOpacity(0.3)),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Container(
+            width: 6,
+            height: 6,
+            decoration: BoxDecoration(color: color, shape: BoxShape.circle),
+          ),
+          const SizedBox(width: 5),
+          Text(
+            isLive ? 'LIVE' : 'PENDING',
+            style: TextStyle(
+              fontSize: 9,
+              fontWeight: FontWeight.w800,
+              color: color,
+              letterSpacing: 0.5,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _SpeedChip extends StatelessWidget {
+  final double speedKmh;
+  const _SpeedChip({required this.speedKmh});
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5),
+      decoration: BoxDecoration(
+        color: const Color(0xFF0F172A).withOpacity(0.06),
+        borderRadius: BorderRadius.circular(10),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          const Icon(Icons.speed_rounded, size: 12, color: _text2),
+          const SizedBox(width: 4),
+          Text(
+            '${speedKmh.toStringAsFixed(0)} km/h',
+            style: const TextStyle(
+              fontSize: 11,
+              fontWeight: FontWeight.w600,
+              color: _text2,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
 class _InfoPill extends StatelessWidget {
   final IconData icon;
-  final String label;
   final String value;
+  final String label;
   final Color color;
 
   const _InfoPill({
     required this.icon,
-    required this.label,
     required this.value,
+    required this.label,
     required this.color,
   });
 
@@ -780,28 +1144,36 @@ class _InfoPill extends StatelessWidget {
   Widget build(BuildContext context) {
     return Expanded(
       child: Container(
-        padding: const EdgeInsets.symmetric(vertical: 10, horizontal: 8),
+        padding: const EdgeInsets.symmetric(vertical: 11, horizontal: 8),
         decoration: BoxDecoration(
           color: color.withOpacity(0.07),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(color: color.withOpacity(0.2)),
+          borderRadius: BorderRadius.circular(14),
+          border: Border.all(color: color.withOpacity(0.18)),
         ),
         child: Column(
+          mainAxisSize: MainAxisSize.min,
           children: [
             Icon(icon, color: color, size: 18),
             const SizedBox(height: 5),
             Text(
               value,
               style: TextStyle(
-                fontSize: 12,
-                fontWeight: FontWeight.bold,
+                fontSize: 12.5,
+                fontWeight: FontWeight.w700,
                 color: color,
               ),
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
             ),
             const SizedBox(height: 2),
-            Text(label, style: const TextStyle(fontSize: 9, color: _text2)),
+            Text(
+              label,
+              style: const TextStyle(
+                fontSize: 9.5,
+                color: _text3,
+                fontWeight: FontWeight.w500,
+              ),
+            ),
           ],
         ),
       ),
@@ -809,11 +1181,8 @@ class _InfoPill extends StatelessWidget {
   }
 }
 
-// ════════════════════════════════════════════════════════════════════════════
-//  WAITING FOR TRAVELER
-// ════════════════════════════════════════════════════════════════════════════
-class _WaitingForTraveler extends StatelessWidget {
-  const _WaitingForTraveler();
+class _WaitingTile extends StatelessWidget {
+  const _WaitingTile();
 
   @override
   Widget build(BuildContext context) {
@@ -836,7 +1205,7 @@ class _WaitingForTraveler extends StatelessWidget {
           Expanded(
             child: Text(
               'Waiting for traveler location…\nTracking will begin shortly.',
-              style: TextStyle(fontSize: 12, color: _orange, height: 1.4),
+              style: TextStyle(fontSize: 12.5, color: _orange, height: 1.5),
             ),
           ),
         ],

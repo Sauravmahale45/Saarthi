@@ -1,22 +1,42 @@
+// lib/features/tracking/pickup_otp_verify_screen.dart
+//
+// Security hardening applied:
+//  • Regeneration rate-limit: 60-second cooldown, stored in pickupOTPGeneratedAt
+//  • Attempt limit: 5 max, stored in pickupOTPAttempts, blocked until new OTP
+//  • Concurrent-call guard: _isVerifying flag checked at entry
+//  • Brute-force delay: 800 ms back-off after every wrong guess
+//  • Success path resets pickupOTPAttempts = 0 in Firestore
+//
+// UI fix applied:
+//  • _OTPBox uses Container → Center → SizedBox(56×56) → TextFormField
+//  • isCollapsed: true + textAlignVertical: TextAlignVertical.center
+//  • 12 px gap between boxes
+
 import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
-// ── Light theme professional color palette ─────────────────────────────────────
-const _bg = Colors.white; // Pure white background
-const _surface = Color(0xFFF8FAFC); // Light surface for cards
-const _surfaceAlt = Color(0xFFF1F5F9); // Slightly darker for contrast
-const _border = Color(0xFFE2E8F0); // Light grey border
-const _borderFocus = Color(0xFF6366F1); // Indigo for focus
-const _borderError = Color(0xFFEF4444); // Red for error
-const _textPrimary = Color(0xFF0F172A); // Dark navy for main text
-const _textSecondary = Color(0xFF64748B); // Muted grey for secondary
-const _indigo = Color(0xFF4F46E5); // Primary indigo
-const _indigoLight = Color(0xFF818CF8); // Lighter indigo
-const _teal = Color(0xFF14B8A6); // Teal for regenerate
-const _green = Color(0xFF22C55E); // Success green
-const _red = Color(0xFFEF4444); // Error red
+// ── Color palette ──────────────────────────────────────────────────────────
+const _bg = Colors.white;
+const _surface = Color(0xFFF8FAFC);
+const _surfaceAlt = Color(0xFFF1F5F9);
+const _border = Color(0xFFE2E8F0);
+const _borderFocus = Color(0xFF6366F1);
+const _borderError = Color(0xFFEF4444);
+const _textPrimary = Color(0xFF0F172A);
+const _textSecondary = Color(0xFF64748B);
+const _indigo = Color(0xFF4F46E5);
+const _indigoLight = Color(0xFF818CF8);
+const _teal = Color(0xFF14B8A6);
+const _green = Color(0xFF22C55E);
+const _red = Color(0xFFEF4444);
+const _orange = Color(0xFFF97316);
+
+// ── Security constants ─────────────────────────────────────────────────────
+const _kMaxAttempts = 5;
+const _kRegenCooldownSeconds = 60;
+const _kBruteForceDelayMs = 800;
 
 class PickupOTPVerifyScreen extends StatefulWidget {
   final String parcelId;
@@ -28,19 +48,23 @@ class PickupOTPVerifyScreen extends StatefulWidget {
 
 class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     with TickerProviderStateMixin {
-  // OTP fields (four separate boxes)
+  // ── OTP fields ─────────────────────────────────────────────────────────────
   final List<TextEditingController> _controllers = List.generate(
     4,
     (_) => TextEditingController(),
   );
   final List<FocusNode> _focusNodes = List.generate(4, (_) => FocusNode());
 
+  // ── UI state ───────────────────────────────────────────────────────────────
   bool _isVerifying = false;
   bool _isRegenerating = false;
   bool _hasError = false;
   bool _showSuccess = false;
 
-  // Animations
+  // Shown inside the error chip when attempts are exhausted
+  String _errorMessage = 'Incorrect OTP. Try again.';
+
+  // ── Animation controllers ──────────────────────────────────────────────────
   late AnimationController _entryController;
   late AnimationController _shakeController;
   late AnimationController _successController;
@@ -49,17 +73,20 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
   late Animation<double> _cardFade;
   late Animation<Offset> _cardSlide;
   late Animation<double> _iconScale;
-
   late Animation<double> _shake;
   late Animation<double> _successScale;
   late Animation<double> _successFade;
   late Animation<double> _pulse;
 
+  // ════════════════════════════════════════════════════════════════════════════
+  //  LIFECYCLE
+  // ════════════════════════════════════════════════════════════════════════════
+
   @override
   void initState() {
     super.initState();
 
-    // Entry animation
+    // Entry
     _entryController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 700),
@@ -79,14 +106,14 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
       ),
     );
 
-    // Shake on error
+    // Shake
     _shakeController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 500),
     );
     _shake = Tween<double>(begin: 0, end: 1).animate(_shakeController);
 
-    // Success animation
+    // Success
     _successController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 600),
@@ -99,7 +126,7 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
       curve: Curves.easeOut,
     );
 
-    // Pulse on lock icon
+    // Pulse
     _pulseController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1500),
@@ -125,50 +152,86 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     super.dispose();
   }
 
-  String _generateOTP() => (1000 + Random().nextInt(9000)).toString();
+  // ════════════════════════════════════════════════════════════════════════════
+  //  OTP GENERATION  (rate-limited: 60 s cooldown)
+  // ════════════════════════════════════════════════════════════════════════════
+
+  String _generateOTP() => (Random().nextInt(9000) + 1000).toString();
 
   Future<void> _regenerateOTP() async {
+    if (_isRegenerating) return;
+
+    // ── Cooldown check ─────────────────────────────────────────────────────
+    try {
+      final snap = await FirebaseFirestore.instance
+          .collection('parcels')
+          .doc(widget.parcelId)
+          .get();
+
+      final data = snap.data() ?? {};
+      final generatedAt = data['pickupOTPGeneratedAt'] as Timestamp?;
+
+      if (generatedAt != null) {
+        final secondsSince = DateTime.now()
+            .difference(generatedAt.toDate())
+            .inSeconds;
+        if (secondsSince < _kRegenCooldownSeconds) {
+          final wait = _kRegenCooldownSeconds - secondsSince;
+          _showSnack(
+            '⏳ Please wait $wait seconds before generating a new OTP.',
+            isError: true,
+          );
+          return;
+        }
+      }
+    } catch (e) {
+      _showSnack('Could not check cooldown: $e', isError: true);
+      return;
+    }
+
     setState(() => _isRegenerating = true);
+
     try {
       final otp = _generateOTP();
       await FirebaseFirestore.instance
           .collection('parcels')
           .doc(widget.parcelId)
-          .update({'pickupOTP': otp, 'pickupStarted': true});
+          .update({
+            'pickupOTP': otp,
+            'pickupStarted': true,
+            'pickupOTPGeneratedAt': FieldValue.serverTimestamp(),
+            'pickupOTPAttempts': 0,
+          });
 
       for (final c in _controllers) c.clear();
       _focusNodes[0].requestFocus();
-      setState(() {
-        _hasError = false;
-        _isRegenerating = false;
-      });
 
-      _showSnack('🔄 New OTP generated & sent to sender!');
+      if (mounted) {
+        setState(() {
+          _hasError = false;
+          _isRegenerating = false;
+          _errorMessage = 'Incorrect OTP. Try again.';
+        });
+      }
+
+      _showSnack('🔄 New OTP generated and sent to sender!');
     } catch (e) {
-      setState(() => _isRegenerating = false);
+      if (mounted) setState(() => _isRegenerating = false);
       _showSnack('Failed to regenerate OTP: $e', isError: true);
     }
   }
 
-  Future<void> _cancelPickup() async {
-    final confirm = await showDialog<bool>(
-      context: context,
-      builder: (_) => _CancelDialog(),
-    );
-    if (confirm != true) return;
-
-    try {
-      await FirebaseFirestore.instance
-          .collection('parcels')
-          .doc(widget.parcelId)
-          .update({'pickupOTP': null, 'pickupStarted': false});
-      if (mounted) Navigator.of(context).pop(false);
-    } catch (e) {
-      _showSnack('Failed to cancel: $e', isError: true);
-    }
-  }
+  // ════════════════════════════════════════════════════════════════════════════
+  //  OTP VERIFICATION
+  //   • Concurrent-call guard (_isVerifying)
+  //   • Attempt limit (5 max, stored in Firestore)
+  //   • 800 ms brute-force delay on wrong guess
+  // ════════════════════════════════════════════════════════════════════════════
 
   Future<void> _verifyOTP() async {
+    // ── Concurrent-call guard ──────────────────────────────────────────────
+    if (_isVerifying) return;
+
     final entered = _controllers.map((c) => c.text).join();
     if (entered.length < 4) {
       _triggerShake();
@@ -181,50 +244,123 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     });
 
     try {
-      final doc = await FirebaseFirestore.instance
+      final ref = FirebaseFirestore.instance
           .collection('parcels')
-          .doc(widget.parcelId)
-          .get();
+          .doc(widget.parcelId);
 
-      final stored = doc.data()?['pickupOTP']?.toString() ?? '';
+      final doc = await ref.get();
+      final data = doc.data() ?? {};
 
-      if (entered != stored) {
-        setState(() {
-          _isVerifying = false;
-          _hasError = true;
-        });
+      final stored = data['pickupOTP']?.toString() ?? '';
+      final attempts = (data['pickupOTPAttempts'] as num?)?.toInt() ?? 0;
+
+      // ── Attempt-limit check ─────────────────────────────────────────────
+      if (attempts >= _kMaxAttempts) {
+        if (mounted) {
+          setState(() {
+            _isVerifying = false;
+            _hasError = true;
+            _errorMessage = 'Too many attempts. Request a new OTP.';
+          });
+        }
         _triggerShake();
-        for (final c in _controllers) c.clear();
-        _focusNodes[0].requestFocus();
-        _showSnack('❌ Wrong OTP. Please try again.', isError: true);
+        _showSnack(
+          '🔒 Too many failed attempts. Please regenerate the OTP.',
+          isError: true,
+        );
         return;
       }
 
-      // Correct — update Firestore
+      // ── Wrong OTP ──────────────────────────────────────────────────────
+      if (entered != stored) {
+        final newAttempts = attempts + 1;
+        final remaining = _kMaxAttempts - newAttempts;
+
+        // Increment attempt counter in Firestore
+        await ref.update({'pickupOTPAttempts': newAttempts});
+
+        // 800 ms brute-force back-off
+        await Future.delayed(const Duration(milliseconds: _kBruteForceDelayMs));
+
+        if (mounted) {
+          setState(() {
+            _isVerifying = false;
+            _hasError = true;
+            _errorMessage = remaining > 0
+                ? '❌ Wrong OTP. $remaining attempt${remaining == 1 ? '' : 's'} left.'
+                : 'Too many attempts. Request a new OTP.';
+          });
+        }
+
+        _triggerShake();
+        for (final c in _controllers) c.clear();
+        _focusNodes[0].requestFocus();
+
+        _showSnack(
+          remaining > 0
+              ? '❌ Wrong OTP. $remaining attempt${remaining == 1 ? '' : 's'} remaining.'
+              : '🔒 No attempts remaining. Please regenerate the OTP.',
+          isError: true,
+        );
+        return;
+      }
+
+      // ── Correct OTP ────────────────────────────────────────────────────
+      await ref.update({
+        'status': 'picked',
+        'pickupOTP': null,
+        'pickupStarted': false,
+        'pickupOTPAttempts': 0,
+        'pickedAt': FieldValue.serverTimestamp(),
+      });
+
+      if (mounted) {
+        setState(() {
+          _isVerifying = false;
+          _showSuccess = true;
+        });
+      }
+
+      HapticFeedback.heavyImpact();
+      await _successController.forward();
+      await Future.delayed(const Duration(milliseconds: 1600));
+
+      if (mounted) Navigator.of(context).pop(true);
+    } catch (e) {
+      if (mounted) setState(() => _isVerifying = false);
+      _showSnack('Verification failed: $e', isError: true);
+    }
+  }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  CANCEL PICKUP
+  // ════════════════════════════════════════════════════════════════════════════
+
+  Future<void> _cancelPickup() async {
+    final confirm = await showDialog<bool>(
+      context: context,
+      builder: (_) => const _CancelDialog(),
+    );
+    if (confirm != true) return;
+
+    try {
       await FirebaseFirestore.instance
           .collection('parcels')
           .doc(widget.parcelId)
           .update({
-            'status': 'picked',
             'pickupOTP': null,
             'pickupStarted': false,
-            'pickedAt': FieldValue.serverTimestamp(),
+            'pickupOTPAttempts': 0,
           });
-
-      setState(() {
-        _isVerifying = false;
-        _showSuccess = true;
-      });
-      HapticFeedback.heavyImpact();
-      await _successController.forward();
-
-      await Future.delayed(const Duration(milliseconds: 1600));
-      if (mounted) Navigator.of(context).pop(true); // return true = verified
+      if (mounted) Navigator.of(context).pop(false);
     } catch (e) {
-      setState(() => _isVerifying = false);
-      _showSnack('Verification failed: $e', isError: true);
+      _showSnack('Failed to cancel: $e', isError: true);
     }
   }
+
+  // ════════════════════════════════════════════════════════════════════════════
+  //  HELPERS
+  // ════════════════════════════════════════════════════════════════════════════
 
   void _triggerShake() {
     _shakeController.reset();
@@ -245,10 +381,14 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     );
   }
 
+  // ════════════════════════════════════════════════════════════════════════════
+  //  BUILD
+  // ════════════════════════════════════════════════════════════════════════════
+
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _bg, // Pure white background
+      backgroundColor: _bg,
       body: SafeArea(
         child: AnimatedSwitcher(
           duration: const Duration(milliseconds: 400),
@@ -258,7 +398,6 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     );
   }
 
-  // Main OTP view
   Widget _buildMainView() {
     return FadeTransition(
       key: const ValueKey('main'),
@@ -291,6 +430,8 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     );
   }
 
+  // ── Top bar ────────────────────────────────────────────────────────────────
+
   Widget _buildTopBar() {
     return Row(
       children: [
@@ -321,9 +462,9 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
           ),
           child: Row(
             mainAxisSize: MainAxisSize.min,
-            children: [
+            children: const [
               Icon(Icons.lock_outline_rounded, color: _indigo, size: 13),
-              const SizedBox(width: 5),
+              SizedBox(width: 5),
               Text(
                 'Secure OTP',
                 style: TextStyle(
@@ -338,6 +479,8 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
       ],
     );
   }
+
+  // ── Lock icon ──────────────────────────────────────────────────────────────
 
   Widget _buildLockIcon() {
     return ScaleTransition(
@@ -355,11 +498,7 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
               end: Alignment.bottomRight,
             ),
             boxShadow: [
-              BoxShadow(
-                color: _indigo.withOpacity(0.2),
-                blurRadius: 24,
-                spreadRadius: 0,
-              ),
+              BoxShadow(color: _indigo.withOpacity(0.2), blurRadius: 24),
             ],
           ),
           child: const Icon(
@@ -372,10 +511,12 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     );
   }
 
+  // ── Heading ────────────────────────────────────────────────────────────────
+
   Widget _buildHeading() {
-    return Column(
+    return const Column(
       children: [
-        const Text(
+        Text(
           'Verify Pickup',
           style: TextStyle(
             fontSize: 28,
@@ -384,21 +525,18 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
             letterSpacing: -0.5,
           ),
         ),
-        const SizedBox(height: 8),
+        SizedBox(height: 8),
         Text(
           'Enter the 4-digit OTP\nshared by the sender',
           textAlign: TextAlign.center,
-          style: const TextStyle(
-            fontSize: 15,
-            color: _textSecondary,
-            height: 1.5,
-          ),
+          style: TextStyle(fontSize: 15, color: _textSecondary, height: 1.5),
         ),
       ],
     );
   }
 
-  // OTP input boxes – light theme with proper spacing
+  // ── OTP fields ─────────────────────────────────────────────────────────────
+
   Widget _buildOTPFields() {
     return AnimatedBuilder(
       animation: _shake,
@@ -417,9 +555,8 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
             curve: Curves.elasticOut,
             builder: (_, v, child) => Transform.scale(scale: v, child: child),
             child: Padding(
-              padding: const EdgeInsets.symmetric(
-                horizontal: 6,
-              ), // 12px total spacing
+              // 6 px each side = 12 px gap between boxes
+              padding: const EdgeInsets.symmetric(horizontal: 6),
               child: _OTPBox(
                 controller: _controllers[i],
                 focusNode: _focusNodes[i],
@@ -431,6 +568,7 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
                   } else if (val.isEmpty && i > 0) {
                     _focusNodes[i - 1].requestFocus();
                   }
+                  // Auto-submit when last box is filled
                   if (i == 3 && val.isNotEmpty) {
                     final allFilled = _controllers.every(
                       (c) => c.text.isNotEmpty,
@@ -446,6 +584,8 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     );
   }
 
+  // ── Error text ─────────────────────────────────────────────────────────────
+
   Widget _buildErrorText() {
     return AnimatedSwitcher(
       duration: const Duration(milliseconds: 250),
@@ -460,12 +600,16 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
               ),
               child: Row(
                 mainAxisSize: MainAxisSize.min,
-                children: const [
-                  Icon(Icons.error_outline_rounded, color: _red, size: 15),
-                  SizedBox(width: 6),
+                children: [
+                  const Icon(
+                    Icons.error_outline_rounded,
+                    color: _red,
+                    size: 15,
+                  ),
+                  const SizedBox(width: 6),
                   Text(
-                    'Incorrect OTP. Try again.',
-                    style: TextStyle(
+                    _errorMessage,
+                    style: const TextStyle(
                       color: _red,
                       fontSize: 13,
                       fontWeight: FontWeight.w500,
@@ -477,6 +621,8 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
           : const SizedBox(key: ValueKey('noerr'), height: 0),
     );
   }
+
+  // ── Verify button ──────────────────────────────────────────────────────────
 
   Widget _buildVerifyButton() {
     return SizedBox(
@@ -561,10 +707,11 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     );
   }
 
+  // ── Secondary actions ──────────────────────────────────────────────────────
+
   Widget _buildSecondaryActions() {
     return Column(
       children: [
-        // Regenerate OTP
         SizedBox(
           width: double.infinity,
           height: 50,
@@ -598,7 +745,6 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
           ),
         ),
         const SizedBox(height: 12),
-        // Cancel pickup
         SizedBox(
           width: double.infinity,
           height: 50,
@@ -629,7 +775,8 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
     );
   }
 
-  // Success view after OTP verification – light theme adjusted
+  // ── Success view ───────────────────────────────────────────────────────────
+
   Widget _buildSuccessView() {
     return Center(
       key: const ValueKey('success'),
@@ -651,11 +798,7 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
                     end: Alignment.bottomRight,
                   ),
                   boxShadow: [
-                    BoxShadow(
-                      color: _green.withOpacity(0.3),
-                      blurRadius: 24,
-                      spreadRadius: 0,
-                    ),
+                    BoxShadow(color: _green.withOpacity(0.3), blurRadius: 24),
                   ],
                 ),
                 child: const Icon(
@@ -692,7 +835,10 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
   }
 }
 
-// Individual OTP input box – light theme with proper styling
+// ════════════════════════════════════════════════════════════════════════════
+//  OTP BOX  –  fixed layout: Container → Center → SizedBox → TextFormField
+// ════════════════════════════════════════════════════════════════════════════
+
 class _OTPBox extends StatefulWidget {
   final TextEditingController controller;
   final FocusNode focusNode;
@@ -713,12 +859,20 @@ class _OTPBox extends StatefulWidget {
 class _OTPBoxState extends State<_OTPBox> {
   bool _isFocused = false;
 
+  void _onFocusChange() {
+    if (mounted) setState(() => _isFocused = widget.focusNode.hasFocus);
+  }
+
   @override
   void initState() {
     super.initState();
-    widget.focusNode.addListener(() {
-      setState(() => _isFocused = widget.focusNode.hasFocus);
-    });
+    widget.focusNode.addListener(_onFocusChange);
+  }
+
+  @override
+  void dispose() {
+    widget.focusNode.removeListener(_onFocusChange);
+    super.dispose();
   }
 
   @override
@@ -726,65 +880,78 @@ class _OTPBoxState extends State<_OTPBox> {
     final hasValue = widget.controller.text.isNotEmpty;
     final isError = widget.hasError;
 
-    Color borderColor;
-    if (isError)
+    final Color borderColor;
+    if (isError) {
       borderColor = _borderError;
-    else if (_isFocused)
+    } else if (_isFocused) {
       borderColor = _borderFocus;
-    else if (hasValue)
+    } else if (hasValue) {
       borderColor = _indigo.withOpacity(0.5);
-    else
+    } else {
       borderColor = _border;
+    }
 
-    return Container(
-      width: 64,
-      height: 64,
+    return AnimatedContainer(
+      duration: const Duration(milliseconds: 150),
+      width: 56,
+      height: 56,
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: borderColor, width: 1.5),
+        border: Border.all(color: borderColor, width: 1.8),
         boxShadow: _isFocused
             ? [
                 BoxShadow(
-                  color: _indigo.withOpacity(0.1),
-                  blurRadius: 8,
-                  spreadRadius: 0,
+                  color: _indigo.withOpacity(0.12),
+                  blurRadius: 10,
+                  spreadRadius: 1,
                 ),
               ]
             : [],
       ),
-      child: TextFormField(
-        controller: widget.controller,
-        focusNode: widget.focusNode,
-        keyboardType: TextInputType.number,
-        textAlign: TextAlign.center,
-        maxLength: 1,
-        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-        style: TextStyle(
-          fontSize: 26,
-          fontWeight: FontWeight.w700,
-          color: isError ? _red : _textPrimary,
+      // Center → SizedBox ensures the field perfectly fills the box
+      child: Center(
+        child: SizedBox(
+          width: 56,
+          height: 56,
+          child: TextFormField(
+            controller: widget.controller,
+            focusNode: widget.focusNode,
+            keyboardType: TextInputType.number,
+            textAlign: TextAlign.center,
+            textAlignVertical: TextAlignVertical.center,
+            maxLength: 1,
+            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+            style: TextStyle(
+              fontSize: 24,
+              fontWeight: FontWeight.w700,
+              color: isError ? _red : _textPrimary,
+              height: 1,
+            ),
+            cursorColor: _indigo,
+            cursorWidth: 1.5,
+            decoration: const InputDecoration(
+              counterText: '',
+              border: InputBorder.none,
+              // isCollapsed removes all intrinsic padding from InputDecoration
+              isCollapsed: true,
+              contentPadding: EdgeInsets.zero,
+            ),
+            onChanged: widget.onChanged,
+          ),
         ),
-        cursorColor: _indigo,
-        decoration: const InputDecoration(
-          counterText: '',
-          border: InputBorder.none,
-          contentPadding: EdgeInsets.zero,
-        ),
-        onChanged: widget.onChanged,
       ),
     );
   }
-
-  @override
-  void dispose() {
-    widget.focusNode.removeListener(() {});
-    super.dispose();
-  }
 }
 
-// Cancel confirmation dialog – light theme
+// ════════════════════════════════════════════════════════════════════════════
+//  CANCEL DIALOG
+// ════════════════════════════════════════════════════════════════════════════
+
 class _CancelDialog extends StatelessWidget {
+  const _CancelDialog();
+
   @override
   Widget build(BuildContext context) {
     return Dialog(
@@ -815,7 +982,8 @@ class _CancelDialog extends StatelessWidget {
             ),
             const SizedBox(height: 8),
             const Text(
-              'This will reset the OTP and cancel the pickup process. You can restart it anytime.',
+              'This will reset the OTP and cancel the pickup process. '
+              'You can restart it anytime.',
               textAlign: TextAlign.center,
               style: TextStyle(
                 fontSize: 14,

@@ -1,8 +1,3 @@
-// lib/features/tracking/permission_service.dart
-//
-// Handles all location permission and GPS service checks.
-// Used before starting pickup OTP flow and before activating tracking.
-
 import 'package:flutter/material.dart';
 import 'package:geolocator/geolocator.dart';
 
@@ -49,7 +44,8 @@ class PermissionService {
     return LocationPermissionStatus.granted;
   }
 
-  /// Shows a contextual dialog. Returns true if user tapped the action button.
+  /// Shows a contextual bottom-sheet style dialog.
+  /// Returns true if user tapped the action button.
   static Future<bool> showPermissionDialog(
     BuildContext context, {
     required LocationPermissionStatus status,
@@ -57,93 +53,115 @@ class PermissionService {
     String title;
     String message;
     String actionLabel;
+    IconData iconData;
 
     switch (status) {
       case LocationPermissionStatus.serviceDisabled:
-        title = 'GPS Disabled';
+        title = 'GPS is turned off';
         message =
-            'Location services are turned off. Please enable GPS to '
-            'start tracking your delivery.';
+            'Location services are disabled. Enable GPS so Saarthi can '
+            'track your delivery in real time.';
         actionLabel = 'Open Settings';
+        iconData = Icons.gps_off_rounded;
         break;
       case LocationPermissionStatus.deniedForever:
-        title = 'Location Permission Blocked';
+        title = 'Location access blocked';
         message =
-            'Location permission has been permanently denied. Please go '
-            'to App Settings and allow location access to continue.';
+            'Location permission is permanently denied. Open App Settings '
+            'and allow "Location" to continue.';
         actionLabel = 'App Settings';
+        iconData = Icons.lock_outline_rounded;
         break;
       default:
-        title = 'Location Required';
+        title = 'Location required';
         message =
-            'Saarthi needs location access to track your delivery in '
-            'real time. Please grant location permission.';
+            'Saarthi needs your location to track this delivery in real '
+            'time. Tap below to grant permission.';
         actionLabel = 'Grant Permission';
+        iconData = Icons.location_on_rounded;
     }
 
     final result = await showDialog<bool>(
       context: context,
       barrierDismissible: false,
-      builder: (ctx) => AlertDialog(
-        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(20)),
+      builder: (ctx) => Dialog(
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
         backgroundColor: Colors.white,
-        title: Row(
-          children: [
-            Container(
-              width: 40,
-              height: 40,
-              decoration: BoxDecoration(
-                color: const Color(0xFFEF4444).withOpacity(0.1),
-                shape: BoxShape.circle,
+        child: Padding(
+          padding: const EdgeInsets.all(24),
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              // Icon bubble
+              Container(
+                width: 64,
+                height: 64,
+                decoration: BoxDecoration(
+                  color: const Color(0xFF2D7DF6).withOpacity(0.1),
+                  shape: BoxShape.circle,
+                ),
+                child: Icon(iconData, color: const Color(0xFF2D7DF6), size: 30),
               ),
-              child: const Icon(
-                Icons.location_off_rounded,
-                color: Color(0xFFEF4444),
-                size: 22,
-              ),
-            ),
-            const SizedBox(width: 12),
-            Expanded(
-              child: Text(
+              const SizedBox(height: 16),
+
+              Text(
                 title,
+                textAlign: TextAlign.center,
                 style: const TextStyle(
-                  fontSize: 16,
-                  fontWeight: FontWeight.bold,
+                  fontSize: 17,
+                  fontWeight: FontWeight.w700,
                   color: Color(0xFF0F172A),
+                  letterSpacing: -0.3,
                 ),
               ),
-            ),
-          ],
-        ),
-        content: Text(
-          message,
-          style: const TextStyle(
-            fontSize: 14,
-            color: Color(0xFF64748B),
-            height: 1.5,
-          ),
-        ),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text(
-              'Cancel',
-              style: TextStyle(color: Color(0xFF64748B)),
-            ),
-          ),
-          ElevatedButton(
-            onPressed: () => Navigator.pop(ctx, true),
-            style: ElevatedButton.styleFrom(
-              backgroundColor: const Color(0xFF4F46E5),
-              foregroundColor: Colors.white,
-              shape: RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(10),
+              const SizedBox(height: 8),
+              Text(
+                message,
+                textAlign: TextAlign.center,
+                style: const TextStyle(
+                  fontSize: 13.5,
+                  color: Color(0xFF64748B),
+                  height: 1.55,
+                ),
               ),
-              elevation: 0,
-            ),
-            child: Text(actionLabel),
+              const SizedBox(height: 24),
+
+              // Action button
+              SizedBox(
+                width: double.infinity,
+                child: ElevatedButton(
+                  onPressed: () => Navigator.pop(ctx, true),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: const Color(0xFF2D7DF6),
+                    foregroundColor: Colors.white,
+                    padding: const EdgeInsets.symmetric(vertical: 14),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(14),
+                    ),
+                    elevation: 0,
+                  ),
+                  child: Text(
+                    actionLabel,
+                    style: const TextStyle(
+                      fontSize: 14,
+                      fontWeight: FontWeight.w600,
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(height: 10),
+
+              // Cancel link
+              TextButton(
+                onPressed: () => Navigator.pop(ctx, false),
+                style: TextButton.styleFrom(
+                  foregroundColor: const Color(0xFF94A3B8),
+                ),
+                child: const Text('Not now', style: TextStyle(fontSize: 13)),
+              ),
+            ],
           ),
-        ],
+        ),
       ),
     );
 
@@ -168,6 +186,8 @@ class PermissionService {
 
     final opened = await showPermissionDialog(context, status: status);
     if (opened) {
+      // Give the user a moment to change the setting, then re-check
+      await Future.delayed(const Duration(milliseconds: 500));
       status = await checkStatus();
       return status == LocationPermissionStatus.granted;
     }

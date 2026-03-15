@@ -1,12 +1,3 @@
-// lib/features/tracking/tracking_service.dart
-//
-// Streams GPS position from Geolocator and writes each update to:
-//   Firestore -> locations/{parcelId}
-//
-// • Uses distanceFilter: 20m to reduce battery drain and Firestore writes.
-// • Overwrites the same document on every update (no collection growth).
-// • Stops automatically when cancel() is called or parcel is delivered.
-
 import 'dart:async';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
@@ -75,6 +66,7 @@ class TrackingService {
         'longitude': pos.longitude,
         'speed': pos.speed, // m/s
         'accuracy': pos.accuracy, // metres
+        'heading': pos.heading, // degrees (0–360) – used for marker rotation
         'updatedAt': FieldValue.serverTimestamp(),
       }); // set() overwrites the single document – no growth
     } catch (e) {

@@ -1,17 +1,10 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  available_travelers_screen.dart  –  Saarthi (UPDATED v4)
+//  available_travelers_screen.dart  –  Saarthi (UPDATED v5)
 //
-//  NEW IN v4:
-//   • 15-minute request-expiry timer running on the SENDER's side.
-//   • When the timer fires (or screen opens and request is already stale):
-//       – status       → 'pending'
-//       – travelerId   → null
-//       – travelerName → null
-//       – ignoredTravelers → arrayUnion([that traveler's id])
-//   • Timer is cancelled whenever the screen is disposed or the parcel
-//     status changes away from 'requested'.
-//   • _checkAndHandleExpiry() also runs every time a new parcel snapshot
-//     arrives, so the screen self-heals even if the timer already fired.
+//  NEW IN v5:
+//   • Area matching (pickup.area == fromArea, drop.area == toArea)
+//   • Rating fetched from users collection, displayed on traveler cards
+//   • Travelers sorted by rating descending (highest first)
 // ════════════════════════════════════════════════════════════════════════════
 
 import 'dart:async';
@@ -61,10 +54,12 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
 
   // ── 15-minute expiry timer (sender side) ──────────────────────────────────
   Timer? _expiryTimer;
-
-  // ── Countdown display (so sender can see how much time is left) ───────────
-  Duration _timeRemaining = Duration.zero;
   Timer? _countdownTicker;
+  Duration _timeRemaining = Duration.zero;
+
+  // ── Enriched travelers list with ratings ──────────────────────────────────
+  List<Map<String, dynamic>>? _filteredTravelersWithRating;
+  bool _loadingRatings = false;
 
   @override
   void initState() {
@@ -84,7 +79,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
 
   // ══════════════════════════════════════════════════════════════════════════
   //  APPLY PARCEL SNAPSHOT
-  //  Called every time Firestore sends a new version of the parcel doc.
   // ══════════════════════════════════════════════════════════════════════════
   void _applyParcelSnapshot(DocumentSnapshot snap) {
     if (!snap.exists) {
@@ -104,53 +98,38 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
       _loadingParcel = false;
     });
 
-    // Every time we get a fresh snapshot, re-evaluate the expiry state.
     _checkAndHandleExpiry(data);
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  EXPIRY LOGIC  (the heart of this update)
+  //  EXPIRY LOGIC
   // ══════════════════════════════════════════════════════════════════════════
-
-  /// Called whenever the parcel snapshot changes.
-  /// • If status == 'requested' and requestedAt > 15 min ago → expire NOW.
-  /// • If status == 'requested' and still within window → arm a precise timer.
-  /// • Otherwise → cancel any running timer.
   void _checkAndHandleExpiry(Map<String, dynamic> data) {
     final status = data['status'] as String? ?? 'pending';
 
     if (status != 'requested') {
-      // Not in a requested state – cancel any lingering timer.
       _cancelExpiryTimer();
       return;
     }
 
     final requestedAt = data['requestedAt'] as Timestamp?;
-    if (requestedAt == null) {
-      // No timestamp → can't calculate expiry, leave as-is.
-      return;
-    }
+    if (requestedAt == null) return;
 
     final elapsed = DateTime.now().difference(requestedAt.toDate());
 
     if (elapsed >= _kRequestExpiry) {
-      // Already expired when this snapshot arrived → expire immediately.
       _cancelExpiryTimer();
       _expireRequest(data);
     } else {
-      // Not yet expired → set a precise timer for the remaining window.
       final remaining = _kRequestExpiry - elapsed;
       _armExpiryTimer(remaining, data);
     }
   }
 
-  /// Arms (or re-arms) the expiry timer for [remaining] duration.
   void _armExpiryTimer(Duration remaining, Map<String, dynamic> data) {
-    // Cancel the old timer first to avoid double-fires.
     _expiryTimer?.cancel();
     _countdownTicker?.cancel();
 
-    // --- Countdown ticker: updates _timeRemaining every second ---
     setState(() => _timeRemaining = remaining);
 
     _countdownTicker = Timer.periodic(const Duration(seconds: 1), (_) {
@@ -162,14 +141,12 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
       });
     });
 
-    // --- Main expiry timer fires once after [remaining] ---
     _expiryTimer = Timer(remaining, () {
       if (!mounted) return;
       _expireRequest(data);
     });
   }
 
-  /// Cancels both the expiry timer and the countdown ticker.
   void _cancelExpiryTimer() {
     _expiryTimer?.cancel();
     _countdownTicker?.cancel();
@@ -178,8 +155,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
     if (mounted) setState(() => _timeRemaining = Duration.zero);
   }
 
-  /// Performs the Firestore expiry write:
-  ///   status → pending, travelerId → null, ignoredTravelers → arrayUnion
   Future<void> _expireRequest(Map<String, dynamic> data) async {
     final travelerId = data['travelerId'] as String?;
     if (travelerId == null || travelerId.isEmpty) return;
@@ -192,7 +167,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
             'status': 'pending',
             'travelerId': null,
             'travelerName': null,
-            // ← add the ignored traveler so they never appear again
             'ignoredTravelers': FieldValue.arrayUnion([travelerId]),
           });
 
@@ -203,7 +177,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  TRAVELER STREAM  (only active routes)
+  //  TRAVELER STREAM (active routes)
   // ══════════════════════════════════════════════════════════════════════════
   Stream<QuerySnapshot>? _buildTravelersStream() {
     final p = _parcel;
@@ -217,13 +191,22 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  CLIENT-SIDE FILTER
+  //  CLIENT-SIDE FILTER (area, bag space, deadline, ignored)
   // ══════════════════════════════════════════════════════════════════════════
   List<QueryDocumentSnapshot> _filterRoutes(
     List<QueryDocumentSnapshot> docs,
     double parcelWeight,
   ) {
+    final p = _parcel!;
     final now = DateTime.now();
+
+    final pickupArea = (p['pickup'] as Map<String, dynamic>?)?.tryGet(
+      'area',
+      '',
+    );
+    final dropArea = (p['drop'] as Map<String, dynamic>?)?.tryGet('area', '');
+    final deliveryDeadline = (p['deliveryDeadline'] as Timestamp?)?.toDate();
+
     return docs.where((doc) {
       final d = doc.data() as Map<String, dynamic>;
 
@@ -234,11 +217,68 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
       final bagSpace = (d['bagSpaceKg'] as num?)?.toDouble() ?? 0;
       if (bagSpace < parcelWeight) return false;
 
-      final ts = d['travelDateTime'] as Timestamp?;
-      if (ts != null && ts.toDate().isBefore(now)) return false;
+      final travelTs = d['travelDateTime'] as Timestamp?;
+      if (travelTs == null || travelTs.toDate().isBefore(now)) return false;
+
+      final fromArea = d['fromArea'] as String? ?? '';
+      final toArea = d['toArea'] as String? ?? '';
+      if (fromArea != pickupArea || toArea != dropArea) return false;
+
+      if (deliveryDeadline != null &&
+          travelTs.toDate().isAfter(deliveryDeadline)) {
+        return false;
+      }
 
       return true;
     }).toList();
+  }
+
+  // ══════════════════════════════════════════════════════════════════════════
+  //  LOAD RATINGS FROM USERS AND SORT
+  // ══════════════════════════════════════════════════════════════════════════
+  Future<void> _loadRatingsAndSort(
+    List<QueryDocumentSnapshot> filteredDocs,
+  ) async {
+    setState(() {
+      _loadingRatings = true;
+      _filteredTravelersWithRating = null;
+    });
+
+    try {
+      final futures = filteredDocs.map((doc) async {
+        final routeData = doc.data() as Map<String, dynamic>;
+        final travelerId = routeData['travelerId'];
+
+        final userDoc = await FirebaseFirestore.instance
+            .collection('users')
+            .doc(travelerId)
+            .get();
+
+        final rating = (userDoc.data()?['rating'] as num?)?.toDouble() ?? 0.0;
+
+        routeData['rating'] = rating;
+        return routeData;
+      });
+
+      final enriched = await Future.wait(futures);
+
+      enriched.sort((a, b) {
+        final aRating = (a['rating'] as num?)?.toDouble() ?? 0.0;
+        final bRating = (b['rating'] as num?)?.toDouble() ?? 0.0;
+        return bRating.compareTo(aRating); // descending
+      });
+
+      setState(() {
+        _filteredTravelersWithRating = enriched;
+        _loadingRatings = false;
+      });
+    } catch (e) {
+      debugPrint('Error loading ratings: $e');
+      setState(() {
+        _filteredTravelersWithRating = [];
+        _loadingRatings = false;
+      });
+    }
   }
 
   // ══════════════════════════════════════════════════════════════════════════
@@ -254,7 +294,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           .collection('parcels')
           .doc(widget.parcelId);
 
-      // Read-before-write: guard against race condition
       final freshSnap = await parcelRef.get();
       if (!freshSnap.exists) {
         _toast('Parcel no longer exists.', isError: true);
@@ -278,8 +317,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
         'requestedAt': FieldValue.serverTimestamp(),
       });
 
-      // Mirror locally for instant UI feedback.
-      // The real-time stream will confirm shortly after.
       setState(() {
         _assignedTravelerId = travelerId;
         _requestingTravelerId = null;
@@ -315,7 +352,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
     return StreamBuilder<DocumentSnapshot>(
       stream: _parcelStream,
       builder: (context, parcelSnap) {
-        // First-load spinner
         if (_loadingParcel &&
             parcelSnap.connectionState == ConnectionState.waiting) {
           return const Scaffold(
@@ -363,7 +399,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  CONTENT
+  //  CONTENT (main UI)
   // ══════════════════════════════════════════════════════════════════════════
   Widget _buildContent() {
     final p = _parcel!;
@@ -537,7 +573,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           ),
         ),
 
-        // ── ⏱ COUNTDOWN BANNER (visible only while status == 'requested') ───
+        // ── ⏱ COUNTDOWN BANNER (only when status == 'requested') ────────────
         if (parcelStatus == 'requested' && _timeRemaining.inSeconds > 0)
           SliverToBoxAdapter(
             child: Padding(
@@ -593,7 +629,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           ),
         ),
 
-        // ── Traveler list ────────────────────────────────────────────────────
+        // ── Traveler list with rating loading and sorting ────────────────────
         SliverPadding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
           sliver: travelersStream == null
@@ -628,6 +664,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                       );
                     }
 
+                    // Apply area/space/deadline filters
                     final filtered = _filterRoutes(allDocs, weight);
                     if (filtered.isEmpty) {
                       return const SliverToBoxAdapter(
@@ -635,10 +672,31 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                       );
                     }
 
+                    // Load ratings and sort (async)
+                    if (_filteredTravelersWithRating == null &&
+                        !_loadingRatings) {
+                      WidgetsBinding.instance.addPostFrameCallback((_) {
+                        _loadRatingsAndSort(filtered);
+                      });
+                    }
+
+                    // Show loading while ratings are being fetched
+                    if (_loadingRatings ||
+                        _filteredTravelersWithRating == null) {
+                      return const SliverToBoxAdapter(
+                        child: Center(
+                          child: Padding(
+                            padding: EdgeInsets.all(40),
+                            child: CircularProgressIndicator(color: _indigo),
+                          ),
+                        ),
+                      );
+                    }
+
+                    // Build list from enriched data
                     return SliverList(
                       delegate: SliverChildBuilderDelegate((ctx, i) {
-                        final doc = filtered[i];
-                        final data = doc.data() as Map<String, dynamic>;
+                        final data = _filteredTravelersWithRating![i];
                         final tid = data['travelerId'] as String? ?? '';
                         final isAssigned = _assignedTravelerId == tid;
                         final isRequesting = _requestingTravelerId == tid;
@@ -650,7 +708,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                             parcelStatus == 'accepted' && !isAssigned;
 
                         return _TravelerCard(
-                          routeData: data,
+                          routeData: data, // now contains 'rating'
                           isAssigned: isAssigned,
                           isAccepted: isAccepted,
                           isRequested: isRequested,
@@ -661,7 +719,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                             data['travelerName'] as String? ?? '',
                           ),
                         );
-                      }, childCount: filtered.length),
+                      }, childCount: _filteredTravelersWithRating!.length),
                     );
                   },
                 ),
@@ -672,8 +730,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  COUNTDOWN BANNER WIDGET
-//  Shows a live "X min Y sec remaining" bar to the sender.
+//  COUNTDOWN BANNER
 // ════════════════════════════════════════════════════════════════════════════
 class _CountdownBanner extends StatelessWidget {
   final Duration remaining;
@@ -758,7 +815,7 @@ class _CountdownBanner extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  PARCEL SUMMARY CARD (unchanged UI)
+//  PARCEL SUMMARY CARD (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _ParcelSummaryCard extends StatelessWidget {
   final Map<String, dynamic> parcel;
@@ -925,7 +982,7 @@ class _ParcelSummaryCard extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  TRAVELER CARD (unchanged UI)
+//  TRAVELER CARD (now with rating display)
 // ════════════════════════════════════════════════════════════════════════════
 class _TravelerCard extends StatelessWidget {
   final Map<String, dynamic> routeData;
@@ -986,6 +1043,7 @@ class _TravelerCard extends StatelessWidget {
     final travelTs = routeData['travelDateTime'] as Timestamp?;
     final fromCity = routeData['fromCity'] as String? ?? '';
     final toCity = routeData['toCity'] as String? ?? '';
+    final rating = (routeData['rating'] as num?)?.toDouble() ?? 0.0;
 
     final initials = name.trim().isEmpty
         ? 'T'
@@ -1073,6 +1131,37 @@ class _TravelerCard extends StatelessWidget {
                                 fontWeight: FontWeight.bold,
                                 color: _text1,
                               ),
+                            ),
+                          ),
+                          // ⭐ Rating chip
+                          Container(
+                            margin: const EdgeInsets.only(right: 8),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 6,
+                              vertical: 2,
+                            ),
+                            decoration: BoxDecoration(
+                              color: Colors.amber.withOpacity(0.1),
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                            child: Row(
+                              mainAxisSize: MainAxisSize.min,
+                              children: [
+                                const Icon(
+                                  Icons.star,
+                                  color: Colors.amber,
+                                  size: 14,
+                                ),
+                                const SizedBox(width: 2),
+                                Text(
+                                  rating.toStringAsFixed(1),
+                                  style: const TextStyle(
+                                    fontSize: 12,
+                                    fontWeight: FontWeight.bold,
+                                    color: Colors.amber,
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                           if (isAccepted) _Badge('Assigned ✓', _green),
@@ -1236,7 +1325,7 @@ class _TravelerCard extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  SHARED SMALL WIDGETS
+//  SHARED SMALL WIDGETS (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _Badge extends StatelessWidget {
   final String label;
@@ -1522,4 +1611,14 @@ class _Divider extends StatelessWidget {
   @override
   Widget build(BuildContext context) =>
       Container(width: 1, height: 40, color: const Color(0xFFE2E8F0));
+}
+
+// ════════════════════════════════════════════════════════════════════════════
+//  EXTENSION: safe map access
+// ════════════════════════════════════════════════════════════════════════════
+extension MapGet on Map<String, dynamic> {
+  T? tryGet<T>(String key, T fallback) {
+    final val = this[key];
+    return (val is T) ? val : fallback;
+  }
 }

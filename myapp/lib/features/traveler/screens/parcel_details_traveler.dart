@@ -4,7 +4,8 @@ import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
 import 'package:intl/intl.dart';
-import 'pickup_otp_verify_screen.dart'; // <-- import the OTP screen
+import 'pickup_otp_verify_screen.dart';
+import '../../../services/wallet_service.dart';
 
 // 👇 NEW: import tracking services
 import '../../tracking/permission_service.dart';
@@ -187,23 +188,41 @@ class _TravelerParcelDetailsScreenState
 
   Future<void> _markAsDelivered() async {
     setState(() => _updating = true);
-    try {
-      await FirebaseFirestore.instance
-          .collection('parcels')
-          .doc(widget.parcelId)
-          .update({
-            'status': 'delivered',
-            'deliveredAt': FieldValue.serverTimestamp(),
-          });
 
-      // 👇 NEW: stop tracking because parcel is delivered
+    try {
+      final parcelRef = FirebaseFirestore.instance
+          .collection('parcels')
+          .doc(widget.parcelId);
+
+      final doc = await parcelRef.get();
+      final data = doc.data() as Map<String, dynamic>;
+
+      final travelerId = data['travelerId'];
+      final price = (data['price'] ?? 0).toDouble();
+
+      // Update parcel status
+      await parcelRef.update({
+        'status': 'delivered',
+        'deliveredAt': FieldValue.serverTimestamp(),
+        'updatedAt': FieldValue.serverTimestamp(),
+      });
+
+      // 👇 Add wallet earning
+      final walletService = WalletService();
+      await walletService.addDeliveryEarning(
+        travelerId: travelerId,
+        price: price,
+      );
+
+      // Stop tracking
       await TrackingService.instance.stopTracking();
 
       setState(() {
         _parcel!['status'] = 'delivered';
         _updating = false;
       });
-      _showToast('✅ Parcel marked as delivered!');
+
+      _showToast('✅ Parcel delivered! Earnings added to wallet.');
     } catch (e) {
       setState(() => _updating = false);
       _showToast('Failed to update: $e', isError: true);
