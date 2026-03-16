@@ -50,6 +50,8 @@ class ParcelTrackingScreen extends StatefulWidget {
 
 class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
     with TickerProviderStateMixin {
+      final List<double> _speedHistory = [];
+double _avgSpeed = 0;
   // ── Controllers ────────────────────────────────────────────────────────────
   final MapController _mapController = MapController();
 
@@ -189,54 +191,123 @@ class _ParcelTrackingScreenState extends State<ParcelTrackingScreen>
               debugPrint('ParcelTrackingScreen: location sub error – $e'),
         );
   }
+int _calculateEtaMinutes(double distanceKm, double avgSpeed) {
+  if (distanceKm <= 0) return 0;
 
+  if (avgSpeed < 5) {
+    avgSpeed = 20; // fallback speed
+  }
+
+  final hours = distanceKm / avgSpeed;
+
+  return (hours * 60).ceil();
+}
   // ════════════════════════════════════════════════════════════════════════════
   //  LOCATION UPDATE HANDLER
   // ════════════════════════════════════════════════════════════════════════════
 
-  void _onLocationUpdate(Map<String, dynamic> data) {
-    final lat = (data['latitude'] as num?)?.toDouble();
-    final lng = (data['longitude'] as num?)?.toDouble();
-    final speed = (data['speed'] as num?)?.toDouble() ?? 0;
-    final heading = (data['heading'] as num?)?.toDouble();
+  // void _onLocationUpdate(Map<String, dynamic> data) {
+  //   final lat = (data['latitude'] as num?)?.toDouble();
+  //   final lng = (data['longitude'] as num?)?.toDouble();
+  //   final speed = (data['speed'] as num?)?.toDouble() ?? 0;
+  //   final heading = (data['heading'] as num?)?.toDouble();
 
-    if (lat == null || lng == null) return;
+  //   if (lat == null || lng == null) return;
 
-    final newPos = LatLng(lat, lng);
+  //   final newPos = LatLng(lat, lng);
 
-    // Skip if coordinates are essentially unchanged (~11 m epsilon)
-    if (_lastProcessedPos != null) {
-      const epsilon = 0.0001;
-      if ((newPos.latitude - _lastProcessedPos!.latitude).abs() < epsilon &&
-          (newPos.longitude - _lastProcessedPos!.longitude).abs() < epsilon) {
-        return;
+  //   // Skip if coordinates are essentially unchanged (~11 m epsilon)
+  //   if (_lastProcessedPos != null) {
+  //     const epsilon = 0.0001;
+  //     if ((newPos.latitude - _lastProcessedPos!.latitude).abs() < epsilon &&
+  //         (newPos.longitude - _lastProcessedPos!.longitude).abs() < epsilon) {
+  //       return;
+  //     }
+  //   }
+
+  //   _lastProcessedPos = newPos;
+
+  //   // Start interpolation animation from current rendered pos → new pos
+  //   _prevPos = _travelerPos ?? newPos;
+  //   _targetPos = newPos;
+  //   _moveCtrl
+  //     ..reset()
+  //     ..forward();
+
+  //   if (mounted) {
+  //     setState(() {
+  //       _heading = heading;
+  //       _speedKmh = speed * 3.6;
+  //       _statusText = 'Parcel is on the way';
+  //     });
+  //   }
+
+  //   // Debounce route fetch: 1.5 s after last position update
+  //   _routeDebounce?.cancel();
+  //   _routeDebounce = Timer(const Duration(milliseconds: 1500), () {
+  //     if (_dest != null) _fetchRoute(newPos, _dest!);
+  //   });
+  // }
+void _onLocationUpdate(Map<String, dynamic> data) {
+  final lat = (data['latitude'] as num?)?.toDouble();
+  final lng = (data['longitude'] as num?)?.toDouble();
+  final speed = (data['speed'] as num?)?.toDouble() ?? 0;
+  final heading = (data['heading'] as num?)?.toDouble();
+
+  if (lat == null || lng == null) return;
+
+  final newPos = LatLng(lat, lng);
+
+  // Skip if coordinates are essentially unchanged (~11 m epsilon)
+  if (_lastProcessedPos != null) {
+    const epsilon = 0.0001;
+    if ((newPos.latitude - _lastProcessedPos!.latitude).abs() < epsilon &&
+        (newPos.longitude - _lastProcessedPos!.longitude).abs() < epsilon) {
+      return;
+    }
+  }
+
+  _lastProcessedPos = newPos;
+
+  // Convert speed from m/s → km/h
+  final speedKmh = speed * 3.6;
+
+  // ── Speed smoothing (last 5 values) ─────────────────────
+  _speedHistory.add(speedKmh);
+
+  if (_speedHistory.length > 5) {
+    _speedHistory.removeAt(0);
+  }
+
+  final avgSpeed =
+      _speedHistory.reduce((a, b) => a + b) / _speedHistory.length;
+
+  // Start interpolation animation from current rendered pos → new pos
+  _prevPos = _travelerPos ?? newPos;
+  _targetPos = newPos;
+  _moveCtrl
+    ..reset()
+    ..forward();
+
+  if (mounted) {
+    setState(() {
+      _heading = heading;
+      _speedKmh = speedKmh;
+      _statusText = 'Parcel is on the way';
+
+      // Update ETA using average speed
+      if (_distanceKm > 0) {
+        _etaMinutes = _calculateEtaMinutes(_distanceKm, avgSpeed);
       }
-    }
-
-    _lastProcessedPos = newPos;
-
-    // Start interpolation animation from current rendered pos → new pos
-    _prevPos = _travelerPos ?? newPos;
-    _targetPos = newPos;
-    _moveCtrl
-      ..reset()
-      ..forward();
-
-    if (mounted) {
-      setState(() {
-        _heading = heading;
-        _speedKmh = speed * 3.6;
-        _statusText = 'Parcel is on the way';
-      });
-    }
-
-    // Debounce route fetch: 1.5 s after last position update
-    _routeDebounce?.cancel();
-    _routeDebounce = Timer(const Duration(milliseconds: 1500), () {
-      if (_dest != null) _fetchRoute(newPos, _dest!);
     });
   }
 
+  // Debounce route fetch: 1.5 s after last position update
+  _routeDebounce?.cancel();
+  _routeDebounce = Timer(const Duration(milliseconds: 1500), () {
+    if (_dest != null) _fetchRoute(newPos, _dest!);
+  });
+}
   // Lerp tick: rebuild map with interpolated marker position
   void _onMoveAnimTick() {
     if (_prevPos == null || _targetPos == null) return;
