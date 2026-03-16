@@ -1186,21 +1186,58 @@ class _ParcelDetailsScreenState extends State<ParcelDetailsScreen> {
         );
 
       case 'picked':
+        final paymentStatus = p['paymentStatus'] as String? ?? 'unpaid';
+
         return Column(
           children: [
-            _PrimaryButton(
-              icon: Icons.payment_rounded,
-              label: 'Make Payment',
-              color: _green,
-              onTap: () => context.push('/make-payment/${widget.parcelId}'),
-            ),
-            const SizedBox(height: 10),
+            // Show payment button ONLY if not paid
+            if (paymentStatus != 'paid') ...[
+              _PrimaryButton(
+                icon: Icons.payment_rounded,
+                label: 'Make Payment',
+                color: _green,
+                onTap: () => context.push('/make-payment/${widget.parcelId}'),
+              ),
+              const SizedBox(height: 10),
+            ],
+
+            // If paid show success message
+            if (paymentStatus == 'paid') ...[
+              Container(
+                width: double.infinity,
+                padding: const EdgeInsets.symmetric(vertical: 16),
+                decoration: BoxDecoration(
+                  color: _green.withOpacity(0.08),
+                  borderRadius: BorderRadius.circular(16),
+                  border: Border.all(color: _green.withOpacity(0.3)),
+                ),
+                child: const Row(
+                  mainAxisAlignment: MainAxisAlignment.center,
+                  children: [
+                    Icon(Icons.check_circle_rounded, color: _green, size: 22),
+                    SizedBox(width: 8),
+                    Text(
+                      'Payment Completed',
+                      style: TextStyle(
+                        fontSize: 16,
+                        fontWeight: FontWeight.bold,
+                        color: _green,
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+              const SizedBox(height: 10),
+            ],
+
+            // ALWAYS show tracking button
             _SecondaryButton(
               icon: Icons.radar_rounded,
               label: 'Track Parcel Live',
               color: _indigo,
               onTap: () {
                 if (_traveler == null || _dropLatLng == null) return;
+
                 Navigator.push(
                   context,
                   MaterialPageRoute(
@@ -1220,6 +1257,7 @@ class _ParcelDetailsScreenState extends State<ParcelDetailsScreen> {
             ),
           ],
         );
+      // If NOT paid → show payment button
 
       case 'delivered':
         return Container(
