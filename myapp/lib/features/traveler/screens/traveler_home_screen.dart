@@ -1606,10 +1606,26 @@ class _HomeTab extends StatelessWidget {
                           Column(
                             crossAxisAlignment: CrossAxisAlignment.end,
                             children: [
-                              _HBadge(
-                                label: '⭐ 4.8 Rating',
-                                bg: Colors.white.withOpacity(0.18),
-                              ),
+                             StreamBuilder<DocumentSnapshot>(
+  stream: FirebaseFirestore.instance
+      .collection('users')
+      .doc(user?.uid)
+      .snapshots(),
+  builder: (context, snapshot) {
+
+    double rating = 0;
+
+    if (snapshot.hasData && snapshot.data!.exists) {
+      final data = snapshot.data!.data() as Map<String, dynamic>;
+      rating = (data['rating'] ?? 0).toDouble();
+    }
+
+    return _HBadge(
+      label: '⭐ ${rating.toStringAsFixed(1)} Rating',
+      bg: Colors.white.withOpacity(0.18),
+    );
+  },
+),
                               const SizedBox(height: 4),
                               _HBadge(
                                 label: kycVerified
@@ -1629,12 +1645,10 @@ class _HomeTab extends StatelessWidget {
                         builder: (_, snap) {
                           double total = 0;
                           final n = snap.data?.docs.length ?? 0;
-                          for (final d in snap.data?.docs ?? []) {
-                            total +=
-                                ((d.data() as Map)['price'] as num?)
-                                    ?.toDouble() ??
-                                0;
-                          }
+                        for (final d in snap.data?.docs ?? []) {
+  final price = ((d.data() as Map)['price'] as num?)?.toDouble() ?? 0;
+  total += price * 0.70;
+}
                           return Row(
                             children: [
                               _QStat(label: 'Deliveries', value: '$n'),
