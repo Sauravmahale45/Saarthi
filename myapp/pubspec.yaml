@@ -53,6 +53,7 @@ dependencies:
   flutter_typeahead: ^5.2.0
   flutter_keyboard_visibility: ^6.0.0
   shared_preferences: ^2.5.4
+  firebase_messaging: ^16.1.2
 
 dev_dependencies:
   flutter_test:
