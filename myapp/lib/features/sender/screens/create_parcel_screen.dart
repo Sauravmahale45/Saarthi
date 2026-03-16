@@ -76,6 +76,7 @@ class MainCategory {
   final IconData icon;
   final List<SubCategory> subCategories;
   final List<ParcelSize> sizes;
+  final double pricePerKm; // ✅ added
 
   const MainCategory({
     required this.label,
@@ -84,6 +85,8 @@ class MainCategory {
     required this.icon,
     required this.subCategories,
     required this.sizes,
+        required this.pricePerKm, // ✅ added
+
   });
 }
 
@@ -94,6 +97,7 @@ final mainCategories = [
     emoji: '📄',
     color: primaryColor,
     icon: Icons.description_outlined,
+        pricePerKm: 2, 
     subCategories: const [
       SubCategory(label: 'Legal Papers', emoji: '⚖️'),
       SubCategory(label: 'Certificate', emoji: '🏅'),
@@ -113,6 +117,7 @@ final mainCategories = [
     emoji: '🍱',
     color: accentColor,
     icon: Icons.fastfood_outlined,
+      pricePerKm: 3, // ₹6/km
     subCategories: const [
       SubCategory(label: 'Seasonal Items', emoji: '🌾'),
       SubCategory(label: 'Home-cooked Meal', emoji: '🍲'),
@@ -132,6 +137,7 @@ final mainCategories = [
     emoji: '📱',
     color: secondaryColor,
     icon: Icons.devices_outlined,
+      pricePerKm: 8, // ₹8/km
     subCategories: const [
       SubCategory(label: 'Mobile / Tablet', emoji: '📱'),
       SubCategory(label: 'Laptop', emoji: '💻'),
@@ -151,6 +157,7 @@ final mainCategories = [
     emoji: '👕',
     color: Color(0xFF10B981),
     icon: Icons.checkroom_outlined,
+      pricePerKm: 2, // ₹2/km
     subCategories: const [
       SubCategory(label: 'Casual Wear', emoji: '👕'),
       SubCategory(label: 'Ethnic / Saree', emoji: '🥻'),
@@ -170,6 +177,7 @@ final mainCategories = [
     emoji: '📦',
     color: Color(0xFF8B5CF6),
     icon: Icons.category_outlined,
+      pricePerKm: 5, // ₹5/km
     subCategories: const [
       SubCategory(label: 'Gift', emoji: '🎁'),
       SubCategory(label: 'Medicines', emoji: '💊'),
@@ -280,7 +288,19 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
     with SingleTickerProviderStateMixin {
   static const _cloudName = 'dwjzuw8fd';
   static const _uploadPreset = 'parcel_upload';
+double _calculateTotalPrice() {
+  if (_distanceKm == null ||
+      _selectedCategory == null ||
+      _selectedSize == null) {
+    return 0;
+  }
 
+  double basePrice = _selectedSize!.price;
+  double distanceCharge =
+      _distanceKm! * _selectedCategory!.pricePerKm;
+
+  return basePrice + distanceCharge;
+}
   // Form keys & controllers
   final _formKey = GlobalKey<FormState>();
   final _receiverCtrl = TextEditingController();
@@ -680,7 +700,7 @@ Future<void> _calculateRoute() async {
         'receiverName': _receiverCtrl.text.trim(),
         'receiverPhone': _receiverPhone.text.trim(),
         'photoUrl': photoUrl,
-        'price': _selectedSize!.price,
+        'price': _calculateTotalPrice(),
 
         // Status and timestamps
         'status': 'pending',
@@ -1451,6 +1471,7 @@ Future<void> _calculateRoute() async {
   }
 
   Widget _buildPriceSummary() {
+    
     final cat = _selectedCategory!;
     final sub = _selectedSub!;
     final size = _selectedSize!;
@@ -1491,6 +1512,21 @@ Future<void> _calculateRoute() async {
           _PriceRow(label: 'Sub-category', value: '${sub.emoji}  ${sub.label}'),
           _PriceRow(label: 'Size', value: size.label),
           _PriceRow(label: 'Weight', value: '${size.weightKg} kg'),
+          _PriceRow(
+  label: 'Distance',
+  value: '${_distanceKm?.toStringAsFixed(1) ?? 0} km',
+),
+
+_PriceRow(
+  label: 'Per KM Charge',
+  value: '₹${_selectedCategory!.pricePerKm}/km',
+),
+
+_PriceRow(
+  label: 'Distance Cost',
+  value:
+      '₹${((_distanceKm ?? 0) * _selectedCategory!.pricePerKm).toStringAsFixed(0)}',
+),
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 10),
             child: Divider(color: Colors.white24, height: 1),
@@ -1516,7 +1552,7 @@ Future<void> _calculateRoute() async {
                   borderRadius: BorderRadius.circular(10),
                 ),
                 child: Text(
-                  '₹${size.price.toStringAsFixed(0)}',
+                  '₹${_calculateTotalPrice().toStringAsFixed(0)}',
                   style: const TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.bold,
