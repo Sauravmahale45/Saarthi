@@ -135,7 +135,7 @@ class _ProfileSetupScreenState extends State<ProfileSetupScreen>
           context.go('/traveler');
           break;
         case 'admin':
-          context.go('/admin_home');
+          context.go('/admin_dashboard');
           break;
         default:
           context.go('/role');

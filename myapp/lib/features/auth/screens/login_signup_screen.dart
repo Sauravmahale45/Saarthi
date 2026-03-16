@@ -30,7 +30,7 @@ Future<void> navigateAfterAuth(BuildContext context) async {
   final ref = FirebaseFirestore.instance.collection('users').doc(uid);
   final snap = await ref.get();
 
-  // ── Create document if it doesn't exist ──────────────────────────────────
+  /// Create user doc if not exists
   if (!snap.exists) {
     await ref.set({
       'name': fireUser.displayName ?? '',
@@ -43,7 +43,6 @@ Future<void> navigateAfterAuth(BuildContext context) async {
     }, SetOptions(merge: true));
   }
 
-  // Re-read after potential creation
   final data = (await ref.get()).data() ?? {};
 
   if (!context.mounted) return;
@@ -52,33 +51,43 @@ Future<void> navigateAfterAuth(BuildContext context) async {
   final phone = (data['phone'] as String?) ?? '';
   final city = (data['city'] as String?) ?? '';
 
-  // 1. No role → role selection
+  /// ADMIN → DIRECT DASHBOARD
+  if (role == 'admin') {
+    context.go('/admin_dashboard');
+    return;
+  }
+
+  /// No role selected
   if (role.isEmpty) {
     context.go('/role');
     return;
   }
 
-  // 2. Role exists but profile incomplete → profile setup
+  /// Profile incomplete
   if (phone.isEmpty || city.isEmpty) {
     context.go('/profile_setup');
     return;
   }
 
-  // 3. Fully set up → home screen
+  /// Go to role home
   _routeToHome(context, role);
 }
 
 void _routeToHome(BuildContext context, String role) {
   switch (role) {
+
     case 'admin':
-      context.go('/admin_home');
+      context.go('/admin_dashboard');
       break;
+
     case 'sender':
       context.go('/sender');
       break;
+
     case 'traveler':
       context.go('/traveler');
       break;
+
     default:
       context.go('/role');
   }
