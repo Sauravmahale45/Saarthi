@@ -12,63 +12,63 @@ import 'features/traveler/screens/traveler_home_screen.dart';
 import 'features/traveler/screens/parcel_details_traveler.dart';
 import 'features/sender/screens/create_parcel_screen.dart';
 import 'features/sender/screens/sender_parcels_screen.dart';
-
 import 'features/sender/screens/available_travelers_screen.dart';
 import 'features/sender/screens/parcel_details.dart';
 import 'features/payment/payment_screen.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
-import 'features/admin//screens/admin_home_screen.dart';
+import 'features/admin/screens/admin_home_screen.dart';
+
+// ── Notification module ────────────────────────────────────────────────────────
+// setRouter() gives NotificationService access to GoRouter so it can call
+// router.go() / router.push() when the user taps a push-notification banner.
+import 'notifications/notifications.dart';
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// ROUTER
+// ROUTER PROVIDER
 // ═══════════════════════════════════════════════════════════════════════════════
 final routerProvider = Provider<GoRouter>((ref) {
-  return GoRouter(
+  final router = GoRouter(
     initialLocation: '/',
     debugLogDiagnostics: true,
     routes: [
-      // Splash — first screen, auto routes by auth state
+      // ── Splash ────────────────────────────────────────────────────────────
       GoRoute(
         path: '/',
         pageBuilder: (context, state) =>
             _fadePage(key: state.pageKey, child: const SplashScreen()),
       ),
 
-      // Login + Signup
+      // ── Auth ──────────────────────────────────────────────────────────────
       GoRoute(
         path: '/login',
         pageBuilder: (context, state) =>
             _slidePage(key: state.pageKey, child: const LoginSignupScreen()),
       ),
-
-      // Role Selection
       GoRoute(
         path: '/role',
         pageBuilder: (context, state) =>
             _slidePage(key: state.pageKey, child: const RoleSelectionScreen()),
       ),
       GoRoute(
+        path: '/profile_setup',
+        builder: (_, __) => const ProfileSetupScreen(),
+      ),
+
+      // ── Admin ─────────────────────────────────────────────────────────────
+      GoRoute(
+        path: '/admin_home',
+        builder: (context, state) => const AdminHomeScreen(),
+      ),
+
+      // ── Sender ────────────────────────────────────────────────────────────
+      GoRoute(
         path: '/sender',
         pageBuilder: (context, state) =>
             _fadePage(key: state.pageKey, child: const SenderHomeScreen()),
       ),
       GoRoute(
-        path: '/profile_setup',
-        builder: (_, __) => const ProfileSetupScreen(),
-      ),
-      // Traveler Home
-      GoRoute(
-        path: '/traveler',
-        pageBuilder: (context, state) =>
-            _fadePage(key: state.pageKey, child: const TravelerHomeScreen()),
-      ),
-      GoRoute(
         path: '/create-parcel',
         builder: (_, __) => const CreateParcelScreen(),
-      ),
-      GoRoute(
-        path: '/admin_home',
-        builder: (context, state) => const AdminHomeScreen(),
       ),
       GoRoute(
         path: '/sender-parcels',
@@ -78,6 +78,10 @@ final routerProvider = Provider<GoRouter>((ref) {
           return SenderParcelsScreen(initialTab: tab);
         },
       ),
+
+      // Sender → available travelers for a parcel.
+      // Notification type parcel_rejected navigates here so the sender
+      // can immediately pick another traveler.
       GoRoute(
         path: '/available-traveler/:parcelId',
         builder: (context, state) {
@@ -85,22 +89,39 @@ final routerProvider = Provider<GoRouter>((ref) {
           return AvailableTravelersScreen(parcelId: parcelId);
         },
       ),
+
+      // Sender → parcel detail.
+      // Notification types parcel_accepted / parcel_pickup / parcel_delivered
+      // all deep-link here.
       GoRoute(
         path: '/parcel-details/:parcelId',
         builder: (context, state) =>
             ParcelDetailsScreen(parcelId: state.pathParameters['parcelId']!),
       ),
+
+      // ── Traveler ──────────────────────────────────────────────────────────
+      // Notification type parcel_request navigates here (home tab shows the
+      // incoming request card at the top automatically).
+      GoRoute(
+        path: '/traveler',
+        pageBuilder: (context, state) =>
+            _fadePage(key: state.pageKey, child: const TravelerHomeScreen()),
+      ),
+
+      // Traveler → parcel detail.
+      // Notification type reminder navigates here.
       GoRoute(
         path: '/traveler-parcel-details/:parcelId',
         builder: (context, state) => TravelerParcelDetailsScreen(
           parcelId: state.pathParameters['parcelId']!,
         ),
       ),
+
+      // ── Payment ───────────────────────────────────────────────────────────
       GoRoute(
         path: '/make-payment/:parcelId',
         builder: (context, state) {
           final parcelId = state.pathParameters['parcelId']!;
-
           return FutureBuilder<DocumentSnapshot>(
             future: FirebaseFirestore.instance
                 .collection('parcels')
@@ -112,9 +133,7 @@ final routerProvider = Provider<GoRouter>((ref) {
                   body: Center(child: CircularProgressIndicator()),
                 );
               }
-
               final data = snapshot.data!.data() as Map<String, dynamic>;
-
               return PaymentScreen(
                 parcelId: parcelId,
                 price: (data['price'] ?? 0).toDouble(),
@@ -127,7 +146,7 @@ final routerProvider = Provider<GoRouter>((ref) {
       ),
     ],
 
-    // ── 404 Error Page ───────────────────────────────────────────────────────
+    // ── 404 ───────────────────────────────────────────────────────────────────
     errorBuilder: (context, state) => Scaffold(
       backgroundColor: Colors.white,
       body: Center(
@@ -167,47 +186,26 @@ final routerProvider = Provider<GoRouter>((ref) {
       ),
     ),
   );
+
+  // ══════════════════════════════════════════════════════════════════════════
+  // REGISTER ROUTER WITH NOTIFICATION SERVICE
+  //
+  // This single line is the entire wiring between GoRouter and FCM taps.
+  //
+  // Why here (inside the provider body)?
+  //   • routerProvider runs the first time ref.watch(routerProvider) is
+  //     called, which is inside SaarthiApp.build() — AFTER ProviderScope
+  //     and Firebase are ready but BEFORE any screen is painted.
+  //   • At that moment the router object exists and NotificationService
+  //     has already been initialised from main.dart, so its tap listeners
+  //     are registered and waiting.  Storing the router here guarantees
+  //     that the very first tap, even one that wakes a terminated app,
+  //     will find a non-null router to navigate with.
+  // ══════════════════════════════════════════════════════════════════════════
+  NotificationService.setRouter(router);
+
+  return router;
 });
-
-// ── Page Transitions ──────────────────────────────────────────────────────────
-
-// Fade transition — for home screens
-CustomTransitionPage<void> _fadePage({
-  required LocalKey key,
-  required Widget child,
-}) {
-  return CustomTransitionPage<void>(
-    key: key,
-    child: child,
-    transitionDuration: const Duration(milliseconds: 350),
-    transitionsBuilder: (context, animation, secondaryAnimation, child) {
-      return FadeTransition(
-        opacity: CurvedAnimation(parent: animation, curve: Curves.easeIn),
-        child: child,
-      );
-    },
-  );
-}
-
-// Slide transition — for auth screens
-CustomTransitionPage<void> _slidePage({
-  required LocalKey key,
-  required Widget child,
-}) {
-  return CustomTransitionPage<void>(
-    key: key,
-    child: child,
-    transitionDuration: const Duration(milliseconds: 350),
-    transitionsBuilder: (context, animation, secondaryAnimation, child) {
-      final tween = Tween<Offset>(
-        begin: const Offset(1.0, 0.0),
-        end: Offset.zero,
-      ).chain(CurveTween(curve: Curves.easeOutCubic));
-
-      return SlideTransition(position: animation.drive(tween), child: child);
-    },
-  );
-}
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // APP WIDGET
@@ -218,7 +216,6 @@ class SaarthiApp extends ConsumerWidget {
   @override
   Widget build(BuildContext context, WidgetRef ref) {
     final router = ref.watch(routerProvider);
-
     return MaterialApp.router(
       title: 'Saarthi',
       debugShowCheckedModeBanner: false,
@@ -229,10 +226,9 @@ class SaarthiApp extends ConsumerWidget {
 }
 
 // ═══════════════════════════════════════════════════════════════════════════════
-// THEME
+// THEME  (unchanged from original)
 // ═══════════════════════════════════════════════════════════════════════════════
 ThemeData _buildTheme() {
-  // ── Color constants ─────────────────────────────────────────────────────────
   const primary = Color(0xFFFF6B35);
   const background = Color(0xFFFAFAFA);
   const surface = Color(0xFFFFFFFF);
@@ -241,12 +237,9 @@ ThemeData _buildTheme() {
   const borderColor = Color(0xFFEEEEEE);
   const cardColor = Color(0xFFF8F8F8);
   const errorColor = Color(0xFFEF4444);
-  const successColor = Color(0xFF22C55E);
 
   return ThemeData(
     useMaterial3: true,
-
-    // ── Color Scheme ──────────────────────────────────────────────────────────
     colorScheme: ColorScheme.fromSeed(
       seedColor: primary,
       brightness: Brightness.light,
@@ -254,14 +247,11 @@ ThemeData _buildTheme() {
       surface: surface,
       primary: primary,
       onPrimary: Colors.white,
-      secondary: const Color(0xFF6366F1), // indigo — sender
-      tertiary: const Color(0xFF10B981), // emerald — traveler
+      secondary: const Color(0xFF6366F1),
+      tertiary: const Color(0xFF10B981),
       error: errorColor,
     ),
-
     scaffoldBackgroundColor: background,
-
-    // ── AppBar ────────────────────────────────────────────────────────────────
     appBarTheme: const AppBarTheme(
       backgroundColor: surface,
       foregroundColor: textDark,
@@ -277,8 +267,6 @@ ThemeData _buildTheme() {
       ),
       iconTheme: IconThemeData(color: textDark, size: 22),
     ),
-
-    // ── Elevated Button ───────────────────────────────────────────────────────
     elevatedButtonTheme: ElevatedButtonThemeData(
       style: ElevatedButton.styleFrom(
         backgroundColor: primary,
@@ -295,16 +283,12 @@ ThemeData _buildTheme() {
         ),
       ),
     ),
-
-    // ── Text Button ───────────────────────────────────────────────────────────
     textButtonTheme: TextButtonThemeData(
       style: TextButton.styleFrom(
         foregroundColor: primary,
         textStyle: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
       ),
     ),
-
-    // ── Outlined Button ───────────────────────────────────────────────────────
     outlinedButtonTheme: OutlinedButtonThemeData(
       style: OutlinedButton.styleFrom(
         foregroundColor: primary,
@@ -314,8 +298,6 @@ ThemeData _buildTheme() {
         textStyle: const TextStyle(fontSize: 16, fontWeight: FontWeight.w600),
       ),
     ),
-
-    // ── Input Decoration ──────────────────────────────────────────────────────
     inputDecorationTheme: InputDecorationTheme(
       filled: true,
       fillColor: cardColor,
@@ -350,8 +332,6 @@ ThemeData _buildTheme() {
         borderSide: const BorderSide(color: errorColor, width: 2),
       ),
     ),
-
-    // ── Card ──────────────────────────────────────────────────────────────────
     cardTheme: CardThemeData(
       color: surface,
       elevation: 0,
@@ -362,8 +342,6 @@ ThemeData _buildTheme() {
       ),
       margin: EdgeInsets.zero,
     ),
-
-    // ── Chip ──────────────────────────────────────────────────────────────────
     chipTheme: ChipThemeData(
       backgroundColor: cardColor,
       selectedColor: primary.withOpacity(0.12),
@@ -378,8 +356,6 @@ ThemeData _buildTheme() {
       ),
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
     ),
-
-    // ── Bottom Sheet ──────────────────────────────────────────────────────────
     bottomSheetTheme: const BottomSheetThemeData(
       backgroundColor: surface,
       surfaceTintColor: Colors.transparent,
@@ -388,8 +364,6 @@ ThemeData _buildTheme() {
       ),
       elevation: 0,
     ),
-
-    // ── FAB ───────────────────────────────────────────────────────────────────
     floatingActionButtonTheme: const FloatingActionButtonThemeData(
       backgroundColor: primary,
       foregroundColor: Colors.white,
@@ -398,8 +372,6 @@ ThemeData _buildTheme() {
         borderRadius: BorderRadius.all(Radius.circular(16)),
       ),
     ),
-
-    // ── SnackBar ──────────────────────────────────────────────────────────────
     snackBarTheme: SnackBarThemeData(
       behavior: SnackBarBehavior.floating,
       backgroundColor: const Color(0xFF1A1A1A),
@@ -407,15 +379,11 @@ ThemeData _buildTheme() {
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(12)),
       elevation: 4,
     ),
-
-    // ── Divider ───────────────────────────────────────────────────────────────
     dividerTheme: const DividerThemeData(
       color: borderColor,
       thickness: 1,
       space: 1,
     ),
-
-    // ── List Tile ─────────────────────────────────────────────────────────────
     listTileTheme: const ListTileThemeData(
       contentPadding: EdgeInsets.symmetric(horizontal: 16, vertical: 4),
       titleTextStyle: TextStyle(
@@ -425,11 +393,7 @@ ThemeData _buildTheme() {
       ),
       subtitleTextStyle: TextStyle(fontSize: 13, color: textLight),
     ),
-
-    // ── Icon ──────────────────────────────────────────────────────────────────
     iconTheme: const IconThemeData(color: textDark, size: 22),
-
-    // ── Text Theme ────────────────────────────────────────────────────────────
     textTheme: const TextTheme(
       displayLarge: TextStyle(
         fontSize: 32,
@@ -480,5 +444,41 @@ ThemeData _buildTheme() {
         color: textLight,
       ),
     ),
+  );
+}
+
+// ── Page Transitions (unchanged) ──────────────────────────────────────────────
+
+CustomTransitionPage<void> _fadePage({
+  required LocalKey key,
+  required Widget child,
+}) {
+  return CustomTransitionPage<void>(
+    key: key,
+    child: child,
+    transitionDuration: const Duration(milliseconds: 350),
+    transitionsBuilder: (context, animation, secondaryAnimation, child) =>
+        FadeTransition(
+          opacity: CurvedAnimation(parent: animation, curve: Curves.easeIn),
+          child: child,
+        ),
+  );
+}
+
+CustomTransitionPage<void> _slidePage({
+  required LocalKey key,
+  required Widget child,
+}) {
+  return CustomTransitionPage<void>(
+    key: key,
+    child: child,
+    transitionDuration: const Duration(milliseconds: 350),
+    transitionsBuilder: (context, animation, secondaryAnimation, child) {
+      final tween = Tween<Offset>(
+        begin: const Offset(1.0, 0.0),
+        end: Offset.zero,
+      ).chain(CurveTween(curve: Curves.easeOutCubic));
+      return SlideTransition(position: animation.drive(tween), child: child);
+    },
   );
 }

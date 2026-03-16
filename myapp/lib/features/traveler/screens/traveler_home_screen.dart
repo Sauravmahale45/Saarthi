@@ -13,6 +13,7 @@ import 'package:myapp/features/auth/screens/login_signup_screen.dart';
 import 'package:permission_handler/permission_handler.dart' hide ServiceStatus;
 import 'package:intl/intl.dart';
 import 'package:flutter_typeahead/flutter_typeahead.dart';
+import 'package:myapp/notifications/notifications.dart';
 
 // Import the new wallet screen
 import '../../../screens/wallet_screen.dart';
@@ -642,22 +643,24 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
 
     try {
       if (accept) {
-        // Read-before-write guard
-        final freshSnap = await FirebaseFirestore.instance
+        final parcelSnap = await FirebaseFirestore.instance
             .collection('parcels')
             .doc(parcelId)
             .get();
-        if (!freshSnap.exists) {
-          _toast('This request no longer exists.', isError: true);
+
+        if (!parcelSnap.exists) {
+          _toast('Parcel not found', isError: true);
           return;
         }
-        final freshData = freshSnap.data()!;
-        final currentStatus = freshData['status'] as String? ?? '';
-        final currentTravelerId = freshData['travelerId'] as String? ?? '';
-        if (currentStatus != 'requested' || currentTravelerId != _user?.uid) {
-          _toast('This request is no longer available.', isError: true);
-          return;
-        }
+
+        final parcelData = parcelSnap.data()!;
+
+        final senderId = parcelData['senderId'];
+        final fromCity = parcelData['fromCity'];
+        final toCity = parcelData['toCity'];
+        final travelerName =
+            FirebaseAuth.instance.currentUser?.displayName ?? 'Traveler';
+
         await FirebaseFirestore.instance
             .collection('parcels')
             .doc(parcelId)
@@ -665,7 +668,17 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
               'status': 'accepted',
               'acceptedAt': FieldValue.serverTimestamp(),
             });
+
         _toast('✅ Request accepted. Contact sender for pickup.');
+
+        // Send notification to sender
+        await NotificationService.notifyParcelAccepted(
+          toUid: senderId,
+          parcelId: parcelId,
+          travelerName: travelerName,
+          fromCity: fromCity,
+          toCity: toCity,
+        );
       } else {
         // Reject → add to ignoredTravelers
         await FirebaseFirestore.instance
