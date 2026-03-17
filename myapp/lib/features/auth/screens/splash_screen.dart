@@ -121,7 +121,7 @@ Future<void> _authRoute(BuildContext context) async {
     } else {
       switch (role) {
         case 'admin':
-          context.go('/admin_home');
+          context.go('/admin_dashboard');
           break;
         case 'sender':
           context.go('/sender');

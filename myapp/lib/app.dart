@@ -16,12 +16,16 @@ import 'features/sender/screens/available_travelers_screen.dart';
 import 'features/sender/screens/parcel_details.dart';
 import 'features/payment/payment_screen.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+<<<<<<< HEAD
+import 'features/admin//screens/admin_dashboard.dart';
+=======
 import 'features/admin/screens/admin_home_screen.dart';
 
 // ── Notification module ────────────────────────────────────────────────────────
 // setRouter() gives NotificationService access to GoRouter so it can call
 // router.go() / router.push() when the user taps a push-notification banner.
 import 'notifications/notifications.dart';
+>>>>>>> 0cabe5e7a03d7505efe129675af24bc2745c0461
 
 // ═══════════════════════════════════════════════════════════════════════════════
 // ROUTER PROVIDER
@@ -70,6 +74,13 @@ final routerProvider = Provider<GoRouter>((ref) {
         path: '/create-parcel',
         builder: (_, __) => const CreateParcelScreen(),
       ),
+<<<<<<< HEAD
+     GoRoute(
+  path: '/admin_dashboard',
+  builder: (context, state) => const AdminDashboard(),
+),
+=======
+>>>>>>> 0cabe5e7a03d7505efe129675af24bc2745c0461
       GoRoute(
         path: '/sender-parcels',
         name: 'senderParcels',
