@@ -672,13 +672,13 @@ class _TravelerHomeScreenState extends State<TravelerHomeScreen> {
         _toast('✅ Request accepted. Contact sender for pickup.');
 
         // Send notification to sender
-       /* await NotificationService.notifyParcelAccepted(
+        await NotificationService.notifyParcelAccepted(
           toUid: senderId,
           parcelId: parcelId,
           travelerName: travelerName,
           fromCity: fromCity,
           toCity: toCity,
-        );*/
+        );
       } else {
         // Reject → add to ignoredTravelers
         await FirebaseFirestore.instance
