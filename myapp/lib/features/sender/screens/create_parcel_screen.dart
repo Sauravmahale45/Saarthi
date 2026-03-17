@@ -120,10 +120,10 @@ final mainCategories = [
       pricePerKm: 3, // ₹6/km
     subCategories: const [
       SubCategory(label: 'Seasonal Items', emoji: '🌾'),
-      SubCategory(label: 'Home-cooked Meal', emoji: '🍲'),
+      // SubCategory(label: 'Home-cooked Meal', emoji: '🍲'),
       SubCategory(label: 'Sweets / Mithai', emoji: '🍬'),
       SubCategory(label: 'Dry Fruits / Nuts', emoji: '🥜'),
-      SubCategory(label: 'Snacks', emoji: '🍿'),
+      // SubCategory(label: 'Snacks', emoji: '🍿'),
       SubCategory(label: 'Other', emoji: '🥡'),
     ],
     sizes: const [
