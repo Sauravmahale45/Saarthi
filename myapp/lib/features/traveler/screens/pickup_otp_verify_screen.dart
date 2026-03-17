@@ -16,6 +16,8 @@ import 'dart:math';
 import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
+import 'package:myapp/notifications/notifications.dart';
+import 'package:firebase_auth/firebase_auth.dart';
 
 // ── Color palette ──────────────────────────────────────────────────────────
 const _bg = Colors.white;
@@ -253,6 +255,7 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
 
       final stored = data['pickupOTP']?.toString() ?? '';
       final attempts = (data['pickupOTPAttempts'] as num?)?.toInt() ?? 0;
+      final senderId = data['senderId'] as String?;
 
       // ── Attempt-limit check ─────────────────────────────────────────────
       if (attempts >= _kMaxAttempts) {
@@ -314,6 +317,22 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
         'pickedAt': FieldValue.serverTimestamp(),
       });
 
+      if (senderId != null) {
+        try {
+          // Get current traveler's name
+          final currentUser = FirebaseAuth.instance.currentUser;
+          final travelerName = await _getTravelerName(currentUser?.uid ?? '');
+          if (travelerName.isNotEmpty) {
+            await NotificationService.notifyParcelPickedUp(
+              toUid: senderId,
+              parcelId: widget.parcelId,
+              travelerName: travelerName,
+            );
+          }
+        } catch (e) {
+          debugPrint('Failed to send pickup notification: $e');
+        }
+      }
       if (mounted) {
         setState(() {
           _isVerifying = false;
@@ -355,6 +374,18 @@ class _PickupOTPVerifyScreenState extends State<PickupOTPVerifyScreen>
       if (mounted) Navigator.of(context).pop(false);
     } catch (e) {
       _showSnack('Failed to cancel: $e', isError: true);
+    }
+  }
+
+  Future<String> _getTravelerName(String uid) async {
+    try {
+      final doc = await FirebaseFirestore.instance
+          .collection('users')
+          .doc(uid)
+          .get();
+      return doc.data()?['name'] ?? doc.data()?['displayName'] ?? 'Traveler';
+    } catch (e) {
+      return 'Traveler';
     }
   }
 
@@ -878,68 +909,53 @@ class _OTPBoxState extends State<_OTPBox> {
   @override
   Widget build(BuildContext context) {
     final hasValue = widget.controller.text.isNotEmpty;
-    final isError = widget.hasError;
 
-    final Color borderColor;
-    if (isError) {
-      borderColor = _borderError;
-    } else if (_isFocused) {
-      borderColor = _borderFocus;
-    } else if (hasValue) {
-      borderColor = _indigo.withOpacity(0.5);
-    } else {
-      borderColor = _border;
-    }
+    final Color borderColor = widget.hasError
+        ? _borderError
+        : _isFocused
+        ? _borderFocus
+        : hasValue
+        ? _indigo.withOpacity(0.6)
+        : _border;
 
     return AnimatedContainer(
-      duration: const Duration(milliseconds: 150),
-      width: 56,
-      height: 56,
+      duration: const Duration(milliseconds: 180),
+      width: 60,
+      height: 60,
+      alignment: Alignment.center,
       decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(12),
-        border: Border.all(color: borderColor, width: 1.8),
+        color: _surface,
+        borderRadius: BorderRadius.circular(14),
+        border: Border.all(color: borderColor, width: 2),
         boxShadow: _isFocused
             ? [
                 BoxShadow(
-                  color: _indigo.withOpacity(0.12),
-                  blurRadius: 10,
+                  color: _indigo.withOpacity(0.15),
+                  blurRadius: 12,
                   spreadRadius: 1,
                 ),
               ]
             : [],
       ),
-      // Center → SizedBox ensures the field perfectly fills the box
-      child: Center(
-        child: SizedBox(
-          width: 56,
-          height: 56,
-          child: TextFormField(
-            controller: widget.controller,
-            focusNode: widget.focusNode,
-            keyboardType: TextInputType.number,
-            textAlign: TextAlign.center,
-            textAlignVertical: TextAlignVertical.center,
-            maxLength: 1,
-            inputFormatters: [FilteringTextInputFormatter.digitsOnly],
-            style: TextStyle(
-              fontSize: 24,
-              fontWeight: FontWeight.w700,
-              color: isError ? _red : _textPrimary,
-              height: 1,
-            ),
-            cursorColor: _indigo,
-            cursorWidth: 1.5,
-            decoration: const InputDecoration(
-              counterText: '',
-              border: InputBorder.none,
-              // isCollapsed removes all intrinsic padding from InputDecoration
-              isCollapsed: true,
-              contentPadding: EdgeInsets.zero,
-            ),
-            onChanged: widget.onChanged,
-          ),
+      child: TextField(
+        controller: widget.controller,
+        focusNode: widget.focusNode,
+        keyboardType: TextInputType.number,
+        textAlign: TextAlign.center,
+        maxLength: 1,
+        inputFormatters: [FilteringTextInputFormatter.digitsOnly],
+        style: TextStyle(
+          fontSize: 26,
+          fontWeight: FontWeight.bold,
+          color: widget.hasError ? _red : _textPrimary,
         ),
+        cursorColor: _indigo,
+        decoration: const InputDecoration(
+          counterText: '',
+          border: InputBorder.none,
+          isCollapsed: true,
+        ),
+        onChanged: widget.onChanged,
       ),
     );
   }

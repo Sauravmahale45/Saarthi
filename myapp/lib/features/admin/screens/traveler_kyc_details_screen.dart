@@ -25,12 +25,12 @@ class TravelerKycDetailsScreen extends StatefulWidget {
   const TravelerKycDetailsScreen({
     super.key,
     required this.travelerId,
+    required this.requestId,
     required this.travelerData,
   });
 
   final String travelerId;
-
-  /// Flat Firestore document map passed from TravelerManagementScreen.
+  final String requestId; // ← ID of the document in kyc_requests
   final Map<String, dynamic> travelerData;
 
   @override
@@ -38,8 +38,7 @@ class TravelerKycDetailsScreen extends StatefulWidget {
       _TravelerKycDetailsScreenState();
 }
 
-class _TravelerKycDetailsScreenState
-    extends State<TravelerKycDetailsScreen> {
+class _TravelerKycDetailsScreenState extends State<TravelerKycDetailsScreen> {
   bool _isUpdating = false;
 
   // ── Firestore update ─────────────────────────────────────────────────────
@@ -49,21 +48,31 @@ class _TravelerKycDetailsScreenState
     required String status,
   }) async {
     setState(() => _isUpdating = true);
+
     try {
-      await FirebaseFirestore.instance
-          .collection('users')
-          .doc(widget.travelerId)
-          .update({
-        'kycVerified'  : verified,
-        'kycStatus'    : status,
+      final firestore = FirebaseFirestore.instance;
+
+      // 1️⃣ Update users collection
+      await firestore.collection('users').doc(widget.travelerId).update({
+        'kycVerified': verified,
+        'kycStatus': status,
         'kycReviewedAt': FieldValue.serverTimestamp(),
       });
+
+      // 2️⃣ Update kyc_requests collection
+      await firestore.collection('kyc_requests').doc(widget.requestId).update({
+        'status': status,
+        'reviewedAt': FieldValue.serverTimestamp(),
+      });
+
       if (!mounted) return;
+
       _showToast(
         verified ? 'KYC Approved successfully' : 'KYC Rejected',
         verified ? _kSuccess : _kDanger,
       );
-      if (mounted) Navigator.pop(context);
+
+      Navigator.pop(context);
     } catch (e) {
       if (!mounted) return;
       _showToast('Update failed: $e', _kDanger);
@@ -77,12 +86,13 @@ class _TravelerKycDetailsScreenState
   void _showToast(String message, Color color) {
     ScaffoldMessenger.of(context).showSnackBar(
       SnackBar(
-        content: Text(message,
-            style: const TextStyle(fontWeight: FontWeight.w600)),
+        content: Text(
+          message,
+          style: const TextStyle(fontWeight: FontWeight.w600),
+        ),
         backgroundColor: color,
         behavior: SnackBarBehavior.floating,
-        shape:
-            RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(10)),
         margin: const EdgeInsets.all(16),
       ),
     );
@@ -98,10 +108,8 @@ class _TravelerKycDetailsScreenState
     final confirmed = await showDialog<bool>(
       context: context,
       builder: (_) => AlertDialog(
-        shape: RoundedRectangleBorder(
-            borderRadius: BorderRadius.circular(16)),
-        title: Text(title,
-            style: const TextStyle(fontWeight: FontWeight.bold)),
+        shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(16)),
+        title: Text(title, style: const TextStyle(fontWeight: FontWeight.bold)),
         content: Text(message),
         actions: [
           TextButton(
@@ -142,26 +150,35 @@ class _TravelerKycDetailsScreenState
   Widget build(BuildContext context) {
     // ── Read flat Firestore fields written by the traveler KYC form ────────
     // fullName is what the form writes; fall back to "name" for older docs
-    final String  name        = _str('fullName',     fallback: _str('name', fallback: 'Unknown'));
-    final String  email       = _str('email');
-    final String  dateOfBirth = _str('dateOfBirth');   // e.g. "2000-03-17"
-    final String  address     = _str('address');       // e.g. "lasalgaon nashik Maharashtra"
-    final String  docType     = _str('documentType');  // e.g. "Aadhaar Card"
-    final String? photo       = _url('photoUrl');
+    final String name = _str(
+      'fullName',
+      fallback: _str('name', fallback: 'Unknown'),
+    );
+    final String email = _str('email');
+    final String dateOfBirth = _str('dateOfBirth'); // e.g. "2000-03-17"
+    final String address = _str(
+      'address',
+    ); // e.g. "lasalgaon nashik Maharashtra"
+    final String docType = _str('documentType'); // e.g. "Aadhaar Card"
+    final String? photo = _url('photoUrl');
 
     // Document photos uploaded by the traveler
-    final String? docUrl      = _url('documentUrl');   // government ID photo
-    final String? selfieUrl   = _url('selfieUrl');     // live selfie photo
+    final String? docUrl = _url('documentUrl'); // government ID photo
+    final String? selfieUrl = _url('selfieUrl'); // live selfie photo
 
     // Form writes "status"; admin panel writes "kycStatus" — accept both
-    final String rawStatus = _str('status', fallback: _str('kycStatus', fallback: 'not_submitted'));
+    final String rawStatus = _str('status', fallback: 'not_submitted');
     // Normalise: "requested" == "submitted" (some form versions use "requested")
-    final String kycStatus = (rawStatus == 'requested') ? 'submitted' : rawStatus;
-    final bool   verified  = widget.travelerData['kycVerified'] == true
-                          || rawStatus == 'approved';
+    final String kycStatus = (rawStatus == 'requested')
+        ? 'submitted'
+        : rawStatus;
+    final bool verified =
+        widget.travelerData['kycVerified'] == true || rawStatus == 'approved';
 
-    final Timestamp? submittedAt = widget.travelerData['submittedAt']   as Timestamp?;
-    final Timestamp? reviewedAt  = widget.travelerData['kycReviewedAt'] as Timestamp?;
+    final Timestamp? submittedAt =
+        widget.travelerData['submittedAt'] as Timestamp?;
+    final Timestamp? reviewedAt =
+        widget.travelerData['kycReviewedAt'] as Timestamp?;
 
     if (kDebugMode) {
       debugPrint(
@@ -176,15 +193,19 @@ class _TravelerKycDetailsScreenState
       appBar: AppBar(
         backgroundColor: Colors.white,
         foregroundColor: const Color(0xFF1A1D23),
-        elevation:        0,
+        elevation: 0,
         surfaceTintColor: Colors.white,
         title: Column(
           crossAxisAlignment: CrossAxisAlignment.start,
           children: [
-            const Text('KYC Details',
-                style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17)),
-            Text('ID: ${widget.travelerId}',
-                style: TextStyle(fontSize: 10, color: Colors.grey[400])),
+            const Text(
+              'KYC Details',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 17),
+            ),
+            Text(
+              'ID: ${widget.travelerId}',
+              style: TextStyle(fontSize: 10, color: Colors.grey[400]),
+            ),
           ],
         ),
       ),
@@ -201,14 +222,14 @@ class _TravelerKycDetailsScreenState
             // ── Traveler information ──────────────────────────────────────
             _SectionCard(
               title: 'Traveler Information',
-              icon:  Icons.person_outline,
+              icon: Icons.person_outline,
               child: _ProfileSection(
-                name:        name,
-                email:       email,
+                name: name,
+                email: email,
                 dateOfBirth: dateOfBirth,
-                address:     address,
+                address: address,
                 documentType: docType,
-                photo:       photo,
+                photo: photo,
               ),
             ),
 
@@ -218,10 +239,10 @@ class _TravelerKycDetailsScreenState
             if (submittedAt != null || reviewedAt != null) ...[
               _SectionCard(
                 title: 'KYC Timeline',
-                icon:  Icons.timeline,
+                icon: Icons.timeline,
                 child: _TimelineSection(
                   submittedAt: submittedAt,
-                  reviewedAt:  reviewedAt,
+                  reviewedAt: reviewedAt,
                 ),
               ),
               const SizedBox(height: 16),
@@ -230,11 +251,8 @@ class _TravelerKycDetailsScreenState
             // ── KYC documents ─────────────────────────────────────────────
             _SectionCard(
               title: 'KYC Documents',
-              icon:  Icons.photo_library_outlined,
-              child: _KycDocumentsSection(
-                docUrl:    docUrl,
-                selfieUrl: selfieUrl,
-              ),
+              icon: Icons.photo_library_outlined,
+              child: _KycDocumentsSection(docUrl: docUrl, selfieUrl: selfieUrl),
             ),
 
             const SizedBox(height: 28),
@@ -245,21 +263,27 @@ class _TravelerKycDetailsScreenState
                   ? const Center(child: CircularProgressIndicator())
                   : _ActionButtons(
                       onApprove: () => _confirmAction(
-                        title:        'Approve KYC?',
-                        message:      "This will verify the traveler's identity "
-                                      'and allow them to use the platform.',
+                        title: 'Approve KYC?',
+                        message:
+                            "This will verify the traveler's identity "
+                            'and allow them to use the platform.',
                         confirmLabel: 'Approve',
                         confirmColor: _kSuccess,
-                        onConfirm:    () => _updateKycStatus(
-                            verified: true, status: 'approved'),
+                        onConfirm: () => _updateKycStatus(
+                          verified: true,
+                          status: 'approved',
+                        ),
                       ),
                       onReject: () => _confirmAction(
-                        title:        'Reject KYC?',
-                        message:      'The traveler will need to resubmit documents.',
+                        title: 'Reject KYC?',
+                        message:
+                            'The traveler will need to resubmit documents.',
                         confirmLabel: 'Reject',
                         confirmColor: _kDanger,
-                        onConfirm:    () => _updateKycStatus(
-                            verified: false, status: 'rejected'),
+                        onConfirm: () => _updateKycStatus(
+                          verified: false,
+                          status: 'rejected',
+                        ),
                       ),
                     ),
           ],
@@ -277,8 +301,8 @@ class _TravelerKycDetailsScreenState
 
 class _KycDocumentsSection extends StatelessWidget {
   const _KycDocumentsSection({
-    required this.docUrl,      // documentUrl from Firestore
-    required this.selfieUrl,   // selfieUrl from Firestore
+    required this.docUrl, // documentUrl from Firestore
+    required this.selfieUrl, // selfieUrl from Firestore
   });
 
   final String? docUrl;
@@ -290,19 +314,19 @@ class _KycDocumentsSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         _DocPhotoTile(
-          label:       'Government ID Photo',
-          subtitle:    'Official identity document',
-          icon:        Icons.credit_card_outlined,
+          label: 'Government ID Photo',
+          subtitle: 'Official identity document',
+          icon: Icons.credit_card_outlined,
           accentColor: _kPrimary,
-          imageUrl:    docUrl,
+          imageUrl: docUrl,
         ),
         const SizedBox(height: 16),
         _DocPhotoTile(
-          label:       'Live Selfie Verification',
-          subtitle:    'Taken at time of KYC submission',
-          icon:        Icons.face_outlined,
+          label: 'Live Selfie Verification',
+          subtitle: 'Taken at time of KYC submission',
+          icon: Icons.face_outlined,
           accentColor: const Color(0xFF7B3FE4),
-          imageUrl:    selfieUrl,
+          imageUrl: selfieUrl,
         ),
       ],
     );
@@ -322,10 +346,10 @@ class _DocPhotoTile extends StatelessWidget {
     required this.imageUrl,
   });
 
-  final String  label;
-  final String  subtitle;
+  final String label;
+  final String subtitle;
   final IconData icon;
-  final Color   accentColor;
+  final Color accentColor;
   final String? imageUrl;
 
   void _openFullScreen(BuildContext context, String url) {
@@ -344,29 +368,36 @@ class _DocPhotoTile extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         // Label row
-        Row(children: [
-          Container(
-            padding: const EdgeInsets.all(7),
-            decoration: BoxDecoration(
-              color:        accentColor.withOpacity(0.10),
-              borderRadius: BorderRadius.circular(8),
+        Row(
+          children: [
+            Container(
+              padding: const EdgeInsets.all(7),
+              decoration: BoxDecoration(
+                color: accentColor.withOpacity(0.10),
+                borderRadius: BorderRadius.circular(8),
+              ),
+              child: Icon(icon, size: 15, color: accentColor),
             ),
-            child: Icon(icon, size: 15, color: accentColor),
-          ),
-          const SizedBox(width: 10),
-          Column(
-            crossAxisAlignment: CrossAxisAlignment.start,
-            children: [
-              Text(label,
+            const SizedBox(width: 10),
+            Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
                   style: const TextStyle(
-                      fontWeight: FontWeight.w600,
-                      fontSize:   13,
-                      color:      Color(0xFF1A1D23))),
-              Text(subtitle,
-                  style: TextStyle(fontSize: 11, color: Colors.grey[500])),
-            ],
-          ),
-        ]),
+                    fontWeight: FontWeight.w600,
+                    fontSize: 13,
+                    color: Color(0xFF1A1D23),
+                  ),
+                ),
+                Text(
+                  subtitle,
+                  style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+                ),
+              ],
+            ),
+          ],
+        ),
 
         const SizedBox(height: 10),
 
@@ -376,12 +407,12 @@ class _DocPhotoTile extends StatelessWidget {
               ? () => _openFullScreen(context, imageUrl!)
               : null,
           child: Container(
-            height:      190,
-            width:       double.infinity,
-            decoration:  BoxDecoration(
-              color:        const Color(0xFFF4F6FB),
+            height: 190,
+            width: double.infinity,
+            decoration: BoxDecoration(
+              color: const Color(0xFFF4F6FB),
               borderRadius: BorderRadius.circular(12),
-              border:       Border.all(color: const Color(0xFFE0E4F0)),
+              border: Border.all(color: const Color(0xFFE0E4F0)),
             ),
             clipBehavior: Clip.antiAlias,
             child: imageUrl != null
@@ -408,18 +439,20 @@ class _NetworkPhoto extends StatelessWidget {
       children: [
         Image.network(
           url,
-          fit:            BoxFit.cover,
-          loadingBuilder: (_, child, progress) =>
-              progress == null ? child : const Center(child: CircularProgressIndicator()),
-          errorBuilder:   (_, __, ___) => _ErrorPlaceholder(),
+          fit: BoxFit.cover,
+          loadingBuilder: (_, child, progress) => progress == null
+              ? child
+              : const Center(child: CircularProgressIndicator()),
+          errorBuilder: (_, __, ___) => _ErrorPlaceholder(),
         ),
         // Tap-to-zoom hint
         Positioned(
-          bottom: 8, right: 8,
+          bottom: 8,
+          right: 8,
           child: Container(
             padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4),
             decoration: BoxDecoration(
-              color:        Colors.black54,
+              color: Colors.black54,
               borderRadius: BorderRadius.circular(8),
             ),
             child: const Row(
@@ -427,8 +460,10 @@ class _NetworkPhoto extends StatelessWidget {
               children: [
                 Icon(Icons.zoom_in, size: 12, color: Colors.white),
                 SizedBox(width: 4),
-                Text('Tap to expand',
-                    style: TextStyle(fontSize: 10, color: Colors.white)),
+                Text(
+                  'Tap to expand',
+                  style: TextStyle(fontSize: 10, color: Colors.white),
+                ),
               ],
             ),
           ),
@@ -441,12 +476,17 @@ class _NetworkPhoto extends StatelessWidget {
 class _ErrorPlaceholder extends StatelessWidget {
   @override
   Widget build(BuildContext context) => Center(
-    child: Column(mainAxisSize: MainAxisSize.min, children: [
-      Icon(Icons.broken_image_outlined, size: 36, color: Colors.grey[400]),
-      const SizedBox(height: 6),
-      Text('Failed to load image',
-          style: TextStyle(fontSize: 12, color: Colors.grey[500])),
-    ]),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(Icons.broken_image_outlined, size: 36, color: Colors.grey[400]),
+        const SizedBox(height: 6),
+        Text(
+          'Failed to load image',
+          style: TextStyle(fontSize: 12, color: Colors.grey[500]),
+        ),
+      ],
+    ),
   );
 }
 
@@ -456,13 +496,21 @@ class _MissingPlaceholder extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) => Center(
-    child: Column(mainAxisSize: MainAxisSize.min, children: [
-      Icon(Icons.image_not_supported_outlined,
-          size: 36, color: Colors.grey[400]),
-      const SizedBox(height: 6),
-      Text('$label not uploaded',
-          style: TextStyle(fontSize: 12, color: Colors.grey[500])),
-    ]),
+    child: Column(
+      mainAxisSize: MainAxisSize.min,
+      children: [
+        Icon(
+          Icons.image_not_supported_outlined,
+          size: 36,
+          color: Colors.grey[400],
+        ),
+        const SizedBox(height: 6),
+        Text(
+          '$label not uploaded',
+          style: TextStyle(fontSize: 12, color: Colors.grey[500]),
+        ),
+      ],
+    ),
   );
 }
 
@@ -490,15 +538,23 @@ class _FullImageViewer extends StatelessWidget {
         child: Center(
           child: Image.network(
             imageUrl,
-            loadingBuilder: (_, child, p) =>
-                p == null ? child : const Center(child: CircularProgressIndicator(color: Colors.white)),
+            loadingBuilder: (_, child, p) => p == null
+                ? child
+                : const Center(
+                    child: CircularProgressIndicator(color: Colors.white),
+                  ),
             errorBuilder: (_, __, ___) => const Center(
-              child: Column(mainAxisSize: MainAxisSize.min, children: [
-                Icon(Icons.broken_image, color: Colors.white54, size: 48),
-                SizedBox(height: 8),
-                Text('Failed to load image',
-                    style: TextStyle(color: Colors.white54)),
-              ]),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  Icon(Icons.broken_image, color: Colors.white54, size: 48),
+                  SizedBox(height: 8),
+                  Text(
+                    'Failed to load image',
+                    style: TextStyle(color: Colors.white54),
+                  ),
+                ],
+              ),
             ),
           ),
         ),
@@ -519,41 +575,49 @@ class _ActionButtons extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Row(children: [
-      Expanded(
-        child: ElevatedButton.icon(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: _kSuccess,
-            foregroundColor: Colors.white,
-            padding:  const EdgeInsets.symmetric(vertical: 14),
-            shape:    RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12)),
-            elevation: 0,
+    return Row(
+      children: [
+        Expanded(
+          child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _kSuccess,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              elevation: 0,
+            ),
+            onPressed: onApprove,
+            icon: const Icon(Icons.check_circle_outline),
+            label: const Text(
+              'Approve KYC',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+            ),
           ),
-          onPressed: onApprove,
-          icon:  const Icon(Icons.check_circle_outline),
-          label: const Text('Approve KYC',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
         ),
-      ),
-      const SizedBox(width: 12),
-      Expanded(
-        child: ElevatedButton.icon(
-          style: ElevatedButton.styleFrom(
-            backgroundColor: _kDanger,
-            foregroundColor: Colors.white,
-            padding:  const EdgeInsets.symmetric(vertical: 14),
-            shape:    RoundedRectangleBorder(
-                borderRadius: BorderRadius.circular(12)),
-            elevation: 0,
+        const SizedBox(width: 12),
+        Expanded(
+          child: ElevatedButton.icon(
+            style: ElevatedButton.styleFrom(
+              backgroundColor: _kDanger,
+              foregroundColor: Colors.white,
+              padding: const EdgeInsets.symmetric(vertical: 14),
+              shape: RoundedRectangleBorder(
+                borderRadius: BorderRadius.circular(12),
+              ),
+              elevation: 0,
+            ),
+            onPressed: onReject,
+            icon: const Icon(Icons.cancel_outlined),
+            label: const Text(
+              'Reject KYC',
+              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15),
+            ),
           ),
-          onPressed: onReject,
-          icon:  const Icon(Icons.cancel_outlined),
-          label: const Text('Reject KYC',
-              style: TextStyle(fontWeight: FontWeight.bold, fontSize: 15)),
         ),
-      ),
-    ]);
+      ],
+    );
   }
 }
 
@@ -564,33 +628,41 @@ class _ActionButtons extends StatelessWidget {
 class _StatusBanner extends StatelessWidget {
   const _StatusBanner({required this.verified, required this.kycStatus});
 
-  final bool   verified;
+  final bool verified;
   final String kycStatus;
 
   @override
   Widget build(BuildContext context) {
-    late Color   bg, border, textColor;
+    late Color bg, border, textColor;
     late IconData icon;
-    late String  label, sublabel;
+    late String label, sublabel;
 
     if (verified) {
-      bg = const Color(0xFFE8F5E9); border = const Color(0xFFA5D6A7);
-      textColor = _kSuccess; icon = Icons.verified_user;
+      bg = const Color(0xFFE8F5E9);
+      border = const Color(0xFFA5D6A7);
+      textColor = _kSuccess;
+      icon = Icons.verified_user;
       label = 'KYC Verified';
       sublabel = 'Identity has been successfully verified.';
     } else if (kycStatus == 'submitted') {
-      bg = const Color(0xFFFFF8F0); border = const Color(0xFFFFCC80);
-      textColor = const Color(0xFFE67E22); icon = Icons.pending_actions;
+      bg = const Color(0xFFFFF8F0);
+      border = const Color(0xFFFFCC80);
+      textColor = const Color(0xFFE67E22);
+      icon = Icons.pending_actions;
       label = 'Awaiting Review';
       sublabel = 'Documents submitted and pending admin review.';
     } else if (kycStatus == 'rejected') {
-      bg = const Color(0xFFFFEBEE); border = const Color(0xFFEF9A9A);
-      textColor = _kDanger; icon = Icons.cancel;
+      bg = const Color(0xFFFFEBEE);
+      border = const Color(0xFFEF9A9A);
+      textColor = _kDanger;
+      icon = Icons.cancel;
       label = 'KYC Rejected';
       sublabel = 'Traveler must resubmit documents.';
     } else {
-      bg = const Color(0xFFF5F5F5); border = const Color(0xFFE0E0E0);
-      textColor = Colors.grey; icon = Icons.help_outline;
+      bg = const Color(0xFFF5F5F5);
+      border = const Color(0xFFE0E0E0);
+      textColor = Colors.grey;
+      icon = Icons.help_outline;
       label = 'Not Submitted';
       sublabel = 'No KYC documents have been submitted yet.';
     }
@@ -598,24 +670,36 @@ class _StatusBanner extends StatelessWidget {
     return Container(
       padding: const EdgeInsets.all(14),
       decoration: BoxDecoration(
-        color:        bg,
-        border:       Border.all(color: border),
+        color: bg,
+        border: Border.all(color: border),
         borderRadius: BorderRadius.circular(12),
       ),
-      child: Row(children: [
-        Icon(icon, color: textColor, size: 28),
-        const SizedBox(width: 12),
-        Expanded(
-          child: Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-            Text(label,
-                style: TextStyle(
-                    fontWeight: FontWeight.bold, fontSize: 14, color: textColor)),
-            const SizedBox(height: 2),
-            Text(sublabel,
-                style: TextStyle(fontSize: 12, color: textColor)),
-          ]),
-        ),
-      ]),
+      child: Row(
+        children: [
+          Icon(icon, color: textColor, size: 28),
+          const SizedBox(width: 12),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: TextStyle(
+                    fontWeight: FontWeight.bold,
+                    fontSize: 14,
+                    color: textColor,
+                  ),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  sublabel,
+                  style: TextStyle(fontSize: 12, color: textColor),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -631,19 +715,23 @@ class _SectionCard extends StatelessWidget {
     required this.child,
   });
 
-  final String   title;
+  final String title;
   final IconData icon;
-  final Widget   child;
+  final Widget child;
 
   @override
   Widget build(BuildContext context) {
     return Container(
       decoration: BoxDecoration(
-        color:        Colors.white,
+        color: Colors.white,
         borderRadius: BorderRadius.circular(16),
-        border:       Border.all(color: const Color(0xFFE8ECF4)),
+        border: Border.all(color: const Color(0xFFE8ECF4)),
         boxShadow: const [
-          BoxShadow(color: Color(0x08000000), blurRadius: 8, offset: Offset(0, 2)),
+          BoxShadow(
+            color: Color(0x08000000),
+            blurRadius: 8,
+            offset: Offset(0, 2),
+          ),
         ],
       ),
       child: Column(
@@ -652,15 +740,20 @@ class _SectionCard extends StatelessWidget {
         children: [
           Padding(
             padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 12),
-            child: Row(children: [
-              Icon(icon, size: 16, color: _kPrimary),
-              const SizedBox(width: 8),
-              Text(title,
+            child: Row(
+              children: [
+                Icon(icon, size: 16, color: _kPrimary),
+                const SizedBox(width: 8),
+                Text(
+                  title,
                   style: const TextStyle(
-                      fontWeight: FontWeight.bold,
-                      fontSize:   13,
-                      color:      Color(0xFF1A1D23))),
-            ]),
+                    fontWeight: FontWeight.bold,
+                    fontSize: 13,
+                    color: Color(0xFF1A1D23),
+                  ),
+                ),
+              ],
+            ),
           ),
           const Divider(height: 1, color: Color(0xFFF0F2F8)),
           Padding(padding: const EdgeInsets.all(16), child: child),
@@ -684,7 +777,7 @@ class _ProfileSection extends StatelessWidget {
     required this.photo,
   });
 
-  final String  name, email, dateOfBirth, address, documentType;
+  final String name, email, dateOfBirth, address, documentType;
   final String? photo;
 
   @override
@@ -693,16 +786,17 @@ class _ProfileSection extends StatelessWidget {
       crossAxisAlignment: CrossAxisAlignment.start,
       children: [
         CircleAvatar(
-          radius:          32,
+          radius: 32,
           backgroundColor: const Color(0xFFE8ECF4),
           backgroundImage: photo != null ? NetworkImage(photo!) : null,
           child: photo == null
               ? Text(
                   name.isNotEmpty ? name[0].toUpperCase() : '?',
                   style: const TextStyle(
-                      fontSize:   24,
-                      fontWeight: FontWeight.bold,
-                      color:      _kPrimary),
+                    fontSize: 24,
+                    fontWeight: FontWeight.bold,
+                    color: _kPrimary,
+                  ),
                 )
               : null,
         ),
@@ -711,14 +805,34 @@ class _ProfileSection extends StatelessWidget {
           child: Column(
             crossAxisAlignment: CrossAxisAlignment.start,
             children: [
-              Text(name,
-                  style: const TextStyle(
-                      fontWeight: FontWeight.bold, fontSize: 16)),
+              Text(
+                name,
+                style: const TextStyle(
+                  fontWeight: FontWeight.bold,
+                  fontSize: 16,
+                ),
+              ),
               const SizedBox(height: 8),
-              _DetailRow(label: 'Email',        value: email,        icon: Icons.email_outlined),
-              _DetailRow(label: 'Date of Birth', value: dateOfBirth, icon: Icons.cake_outlined),
-              _DetailRow(label: 'Address',       value: address,     icon: Icons.location_on_outlined),
-              _DetailRow(label: 'Document',      value: documentType, icon: Icons.credit_card_outlined),
+              _DetailRow(
+                label: 'Email',
+                value: email,
+                icon: Icons.email_outlined,
+              ),
+              _DetailRow(
+                label: 'Date of Birth',
+                value: dateOfBirth,
+                icon: Icons.cake_outlined,
+              ),
+              _DetailRow(
+                label: 'Address',
+                value: address,
+                icon: Icons.location_on_outlined,
+              ),
+              _DetailRow(
+                label: 'Document',
+                value: documentType,
+                icon: Icons.credit_card_outlined,
+              ),
             ],
           ),
         ),
@@ -734,7 +848,7 @@ class _DetailRow extends StatelessWidget {
     required this.icon,
   });
 
-  final String   label, value;
+  final String label, value;
   final IconData icon;
 
   @override
@@ -742,18 +856,23 @@ class _DetailRow extends StatelessWidget {
     if (value.isEmpty) return const SizedBox.shrink();
     return Padding(
       padding: const EdgeInsets.only(bottom: 6),
-      child: Row(children: [
-        Icon(icon, size: 14, color: Colors.grey[500]),
-        const SizedBox(width: 6),
-        Text('$label: ',
-            style: TextStyle(fontSize: 12, color: Colors.grey[500])),
-        Expanded(
-          child: Text(value,
-              style: const TextStyle(
-                  fontSize: 12, fontWeight: FontWeight.w500),
-              overflow: TextOverflow.ellipsis),
-        ),
-      ]),
+      child: Row(
+        children: [
+          Icon(icon, size: 14, color: Colors.grey[500]),
+          const SizedBox(width: 6),
+          Text(
+            '$label: ',
+            style: TextStyle(fontSize: 12, color: Colors.grey[500]),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: const TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+              overflow: TextOverflow.ellipsis,
+            ),
+          ),
+        ],
+      ),
     );
   }
 }
@@ -763,8 +882,7 @@ class _DetailRow extends StatelessWidget {
 // ─────────────────────────────────────────────────────────────────────────────
 
 class _TimelineSection extends StatelessWidget {
-  const _TimelineSection(
-      {required this.submittedAt, required this.reviewedAt});
+  const _TimelineSection({required this.submittedAt, required this.reviewedAt});
 
   final Timestamp? submittedAt;
   final Timestamp? reviewedAt;
@@ -772,8 +890,18 @@ class _TimelineSection extends StatelessWidget {
   static String _fmt(Timestamp ts) {
     final dt = ts.toDate().toLocal();
     const months = [
-      'Jan','Feb','Mar','Apr','May','Jun',
-      'Jul','Aug','Sep','Oct','Nov','Dec',
+      'Jan',
+      'Feb',
+      'Mar',
+      'Apr',
+      'May',
+      'Jun',
+      'Jul',
+      'Aug',
+      'Sep',
+      'Oct',
+      'Nov',
+      'Dec',
     ];
     final h = dt.hour.toString().padLeft(2, '0');
     final m = dt.minute.toString().padLeft(2, '0');
@@ -782,22 +910,24 @@ class _TimelineSection extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return Column(children: [
-      if (submittedAt != null)
-        _TimelineRow(
-          icon:  Icons.upload_file,
-          color: _kPrimary,
-          label: 'Documents Submitted',
-          date:  _fmt(submittedAt!),
-        ),
-      if (reviewedAt != null)
-        _TimelineRow(
-          icon:  Icons.rate_review_outlined,
-          color: _kSuccess,
-          label: 'Admin Reviewed',
-          date:  _fmt(reviewedAt!),
-        ),
-    ]);
+    return Column(
+      children: [
+        if (submittedAt != null)
+          _TimelineRow(
+            icon: Icons.upload_file,
+            color: _kPrimary,
+            label: 'Documents Submitted',
+            date: _fmt(submittedAt!),
+          ),
+        if (reviewedAt != null)
+          _TimelineRow(
+            icon: Icons.rate_review_outlined,
+            color: _kSuccess,
+            label: 'Admin Reviewed',
+            date: _fmt(reviewedAt!),
+          ),
+      ],
+    );
   }
 }
 
@@ -810,28 +940,39 @@ class _TimelineRow extends StatelessWidget {
   });
 
   final IconData icon;
-  final Color    color;
-  final String   label, date;
+  final Color color;
+  final String label, date;
 
   @override
   Widget build(BuildContext context) {
     return Padding(
       padding: const EdgeInsets.only(bottom: 10),
-      child: Row(children: [
-        CircleAvatar(
-          radius:          14,
-          backgroundColor: color.withOpacity(0.12),
-          child: Icon(icon, size: 14, color: color),
-        ),
-        const SizedBox(width: 12),
-        Column(crossAxisAlignment: CrossAxisAlignment.start, children: [
-          Text(label,
-              style: const TextStyle(
-                  fontWeight: FontWeight.w600, fontSize: 13)),
-          Text(date,
-              style: TextStyle(fontSize: 11, color: Colors.grey[500])),
-        ]),
-      ]),
+      child: Row(
+        children: [
+          CircleAvatar(
+            radius: 14,
+            backgroundColor: color.withOpacity(0.12),
+            child: Icon(icon, size: 14, color: color),
+          ),
+          const SizedBox(width: 12),
+          Column(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Text(
+                label,
+                style: const TextStyle(
+                  fontWeight: FontWeight.w600,
+                  fontSize: 13,
+                ),
+              ),
+              Text(
+                date,
+                style: TextStyle(fontSize: 11, color: Colors.grey[500]),
+              ),
+            ],
+          ),
+        ],
+      ),
     );
   }
 }
@@ -842,4 +983,4 @@ class _TimelineRow extends StatelessWidget {
 
 const Color _kPrimary = Color(0xFF3B5BDB);
 const Color _kSuccess = Color(0xFF2E7D32);
-const Color _kDanger  = Color(0xFFC62828);
+const Color _kDanger = Color(0xFFC62828);

@@ -1,15 +1,33 @@
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:intl/intl.dart';
+import '../../../features/tracking/parcel_tracking_screen.dart';
 
-class ParcelManagementScreen extends StatelessWidget {
+// Color palette
+const _indigo = Color(0xFF4F46E5);
+const _indigoL = Color(0xFF818CF8);
+const _teal = Color(0xFF14B8A6);
+const _orange = Color(0xFFF97316);
+const _green = Color(0xFF22C55E);
+const _red = Color(0xFFEF4444);
+const _bg = Color(0xFFF5F7FF);
+const _card = Colors.white;
+const _text1 = Color(0xFF0F172A);
+const _text2 = Color(0xFF64748B);
+const _border = Color(0xFFE2E8F0);
+
+class ParcelManagementScreen extends StatefulWidget {
   const ParcelManagementScreen({super.key});
 
-  // ---------------------------------------------------------------------------
-  // FIRESTORE STREAM
-  // Real-time stream of the entire 'parcels' collection ordered by creation
-  // date (newest first).  Falls back gracefully if the field is absent.
-  // ---------------------------------------------------------------------------
+  @override
+  State<ParcelManagementScreen> createState() => _ParcelManagementScreenState();
+}
+
+class _ParcelManagementScreenState extends State<ParcelManagementScreen> {
+  String _searchText = '';
+  String? _selectedStatusFilter;
+  final TextEditingController _searchController = TextEditingController();
 
   Stream<QuerySnapshot> _parcelsStream() {
     return FirebaseFirestore.instance
@@ -18,189 +36,648 @@ class ParcelManagementScreen extends StatelessWidget {
         .snapshots();
   }
 
-  // ---------------------------------------------------------------------------
-  // SAFE DATA EXTRACTION
-  // All field access is done through this helper so no single missing field
-  // can crash the UI.
-  // ---------------------------------------------------------------------------
-
-  Map<String, String> _safeParcel(QueryDocumentSnapshot doc) {
+  /// Safely extracts all fields from a parcel document.
+  Map<String, dynamic> _safeParcel(QueryDocumentSnapshot doc) {
     final Map<String, dynamic> raw =
         (doc.data() as Map<String, dynamic>?) ?? {};
 
+    // Helper to safely get a string; if missing, fallback to doc.id for orderId
+    String safeString(String key, [String fallback = 'N/A']) {
+      final val = raw[key];
+      return val is String && val.isNotEmpty ? val : fallback;
+    }
+
+    // Special handling for orderId: if missing, use document id
+    final orderId = safeString('orderId');
+    final displayOrderId = orderId == 'N/A' ? doc.id : orderId;
+
+    // Helper to safely get a number as double
+    double safeDouble(String key, [double fallback = 0.0]) {
+      final val = raw[key];
+      if (val is num) return val.toDouble();
+      if (val is String) return double.tryParse(val) ?? fallback;
+      return fallback;
+    }
+
+    // Helper to safely get a map
+    Map<String, dynamic> safeMap(String key) {
+      final val = raw[key];
+      return val is Map<String, dynamic> ? val : {};
+    }
+
+    // Parse pickup and drop maps
+    final pickupMap = safeMap('pickup');
+    final dropMap = safeMap('drop');
+
     return {
-      'id':       raw['id']       is String ? raw['id']       as String : doc.id,
-      'sender':   raw['sender']   is String ? raw['sender']   as String : 'Unknown',
-      'traveler': raw['traveler'] is String ? raw['traveler'] as String : 'Unassigned',
-      'weight':   raw['weight']   is String ? raw['weight']   as String : 'N/A',
-      'status':   raw['status']   is String ? raw['status']   as String : 'Pending',
+      'id': doc.id,
+      'orderId': displayOrderId,
+      'category': safeString('category'),
+      'subCategory': safeString('subCategory'),
+      'size': safeString('size'),
+      'weight': safeDouble('weight'),
+      'price': safeDouble('price'),
+      'distanceKm': safeDouble('distanceKm'),
+      'etaMinutes': safeDouble('etaMinutes'),
+      'status': safeString('status', 'Pending'),
+      'description': safeString('description'),
+      'photoUrl': safeString('photoUrl'),
+      'senderId': safeString('senderId'),
+      'senderName': safeString('senderName'),
+      'senderEmail': safeString('senderEmail'),
+      'receiverName': safeString('receiverName'),
+      'receiverPhone': safeString('receiverPhone'),
+      'travelerId': safeString('travelerId'),
+      'travelerName': safeString('travelerName'),
+      'fromCity': safeString('fromCity'),
+      'toCity': safeString('toCity'),
+      'paymentStatus': safeString('paymentStatus'),
+      'paymentId': safeString('paymentId'),
+      'pickupOTP': raw['pickupOTP'], // can be null
+      'pickupOTPAttempts': raw['pickupOTPAttempts'] ?? 0,
+      'pickupStarted': raw['pickupStarted'] ?? false,
+      'createdAt': raw['createdAt'] as Timestamp?,
+      'acceptedAt': raw['acceptedAt'] as Timestamp?,
+      'pickedAt': raw['pickedAt'] as Timestamp?,
+      'deliveryDeadline': raw['deliveryDeadline'] as Timestamp?,
+      'paidAt': raw['paidAt'] as Timestamp?,
+      'pickup': pickupMap,
+      'drop': dropMap,
     };
+  }
+
+  String _formatDate(Timestamp? ts) {
+    if (ts == null) return 'N/A';
+    return DateFormat.yMMMd().add_jm().format(ts.toDate());
+  }
+
+  String _formatWeight(double weight) {
+    return weight.toStringAsFixed(1);
+  }
+
+  // ---------------------------------------------------------------------------
+  // BOTTOM DRAWER FOR DETAILS
+  // ---------------------------------------------------------------------------
+  void _showParcelDetails(Map<String, dynamic> parcel) {
+    showModalBottomSheet(
+      context: context,
+      isScrollControlled: true,
+      shape: const RoundedRectangleBorder(
+        borderRadius: BorderRadius.vertical(top: Radius.circular(24)),
+      ),
+      backgroundColor: _card,
+      builder: (ctx) {
+        return DraggableScrollableSheet(
+          initialChildSize: 0.9,
+          minChildSize: 0.5,
+          maxChildSize: 0.95,
+          expand: false,
+          builder: (_, scrollController) {
+            return Container(
+              padding: const EdgeInsets.all(20),
+              child: Column(
+                crossAxisAlignment: CrossAxisAlignment.start,
+                children: [
+                  // Header with drag handle
+                  Center(
+                    child: Container(
+                      width: 40,
+                      height: 4,
+                      decoration: BoxDecoration(
+                        color: _border,
+                        borderRadius: BorderRadius.circular(2),
+                      ),
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    'Parcel Details',
+                    style: TextStyle(
+                      fontSize: 20,
+                      fontWeight: FontWeight.bold,
+                      color: _indigo,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Expanded(
+                    child: ListView(
+                      controller: scrollController,
+                      children: [
+                        _detailSection('Order Information', [
+                          _detailRow('Order ID', parcel['orderId']),
+                          _detailRow(
+                            'Status',
+                            parcel['status'],
+                            valueColor: _statusColor(parcel['status']),
+                          ),
+                          _detailRow('Category', parcel['category']),
+                          _detailRow('Sub‑Category', parcel['subCategory']),
+                          _detailRow('Size', parcel['size']),
+                          _detailRow(
+                            'Weight',
+                            '${_formatWeight(parcel['weight'])} kg',
+                          ),
+                          _detailRow(
+                            'Price',
+                            '₹${parcel['price'].toStringAsFixed(2)}',
+                          ),
+                          _detailRow(
+                            'Distance',
+                            '${parcel['distanceKm'].toStringAsFixed(1)} km',
+                          ),
+                          _detailRow('ETA', '${parcel['etaMinutes']} min'),
+                        ]),
+                        _detailSection('Sender', [
+                          _detailRow('Name', parcel['senderName']),
+                          _detailRow('Email', parcel['senderEmail']),
+                        ]),
+                        _detailSection('Receiver', [
+                          _detailRow('Name', parcel['receiverName']),
+                          _detailRow('Phone', parcel['receiverPhone']),
+                        ]),
+                        _detailSection('Pickup', [
+                          _detailRow(
+                            'Address',
+                            parcel['pickup']['address'] ?? 'N/A',
+                          ),
+                          _detailRow('Area', parcel['pickup']['area'] ?? 'N/A'),
+                          _detailRow('City', parcel['pickup']['city'] ?? 'N/A'),
+                          if (parcel['pickupOTP'] != null)
+                            _detailRow('OTP', parcel['pickupOTP'].toString()),
+                          _detailRow(
+                            'OTP Attempts',
+                            parcel['pickupOTPAttempts'].toString(),
+                          ),
+                          _detailRow(
+                            'Pickup Started',
+                            parcel['pickupStarted'] ? 'Yes' : 'No',
+                          ),
+                        ]),
+                        _detailSection('Drop', [
+                          _detailRow(
+                            'Address',
+                            parcel['drop']['address'] ?? 'N/A',
+                          ),
+                          _detailRow('Area', parcel['drop']['area'] ?? 'N/A'),
+                          _detailRow('City', parcel['drop']['city'] ?? 'N/A'),
+                        ]),
+                        _detailSection('Traveler', [
+                          _detailRow('Name', parcel['travelerName']),
+                          _detailRow('ID', parcel['travelerId']),
+                        ]),
+                        _detailSection('Timestamps', [
+                          _detailRow(
+                            'Created',
+                            _formatDate(parcel['createdAt']),
+                          ),
+                          _detailRow(
+                            'Accepted',
+                            _formatDate(parcel['acceptedAt']),
+                          ),
+                          _detailRow('Picked', _formatDate(parcel['pickedAt'])),
+                          _detailRow(
+                            'Deadline',
+                            _formatDate(parcel['deliveryDeadline']),
+                          ),
+                          _detailRow('Paid', _formatDate(parcel['paidAt'])),
+                        ]),
+                        _detailSection('Payment', [
+                          _detailRow('Status', parcel['paymentStatus']),
+                          _detailRow('Payment ID', parcel['paymentId']),
+                        ]),
+                      ],
+                    ),
+                  ),
+                ],
+              ),
+            );
+          },
+        );
+      },
+    );
+  }
+
+  Widget _detailSection(String title, List<Widget> rows) {
+    return Column(
+      crossAxisAlignment: CrossAxisAlignment.start,
+      children: [
+        Padding(
+          padding: const EdgeInsets.symmetric(vertical: 12),
+          child: Text(
+            title,
+            style: TextStyle(
+              fontSize: 16,
+              fontWeight: FontWeight.bold,
+              color: _indigo,
+            ),
+          ),
+        ),
+        ...rows,
+        const Divider(height: 24, color: _border),
+      ],
+    );
+  }
+
+  Widget _detailRow(String label, String value, {Color? valueColor}) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 6),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          SizedBox(
+            width: 100,
+            child: Text(label, style: TextStyle(fontSize: 13, color: _text2)),
+          ),
+          Expanded(
+            child: Text(
+              value,
+              style: TextStyle(
+                fontSize: 13,
+                fontWeight: FontWeight.w500,
+                color: valueColor ?? _text1,
+              ),
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Color _statusColor(String status) {
+    switch (status) {
+      case 'Delivered':
+        return _green;
+      case 'picked':
+      case 'In Transit':
+        return _teal;
+      case 'Pending':
+        return _orange;
+      case 'Cancelled':
+        return _red;
+      default:
+        return _text2;
+    }
+  }
+
+  // ---------------------------------------------------------------------------
+  // CARD WIDGET (modern, full‑width)
+  // ---------------------------------------------------------------------------
+  Widget _parcelCard(BuildContext context, Map<String, dynamic> parcel) {
+    final status = parcel['status'] as String;
+    final statusColor = _statusColor(status);
+
+    return Container(
+      margin: const EdgeInsets.symmetric(vertical: 8),
+      padding: const EdgeInsets.all(16),
+      decoration: BoxDecoration(
+        color: _card,
+        borderRadius: BorderRadius.circular(16),
+        border: Border.all(color: _border),
+        boxShadow: [
+          BoxShadow(
+            blurRadius: 8,
+            color: Colors.black.withOpacity(0.02),
+            offset: const Offset(0, 2),
+          ),
+        ],
+      ),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Row(
+            crossAxisAlignment: CrossAxisAlignment.start,
+            children: [
+              Container(
+                width: 48,
+                height: 48,
+                decoration: BoxDecoration(
+                  color: _indigoL.withOpacity(0.2),
+                  borderRadius: BorderRadius.circular(12),
+                ),
+                child: Icon(Icons.inventory_2_outlined, color: _indigo),
+              ),
+              const SizedBox(width: 12),
+              Expanded(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    Row(
+                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                      children: [
+                        Expanded(
+                          child: Text(
+                            parcel['orderId'],
+                            style: TextStyle(
+                              fontSize: 15,
+                              fontWeight: FontWeight.bold,
+                              color: _text1,
+                            ),
+                            overflow: TextOverflow.ellipsis,
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
+                          decoration: BoxDecoration(
+                            color: statusColor.withOpacity(0.1),
+                            borderRadius: BorderRadius.circular(12),
+                          ),
+                          child: Text(
+                            status,
+                            style: TextStyle(
+                              fontSize: 11,
+                              fontWeight: FontWeight.bold,
+                              color: statusColor,
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 4),
+                    Text(
+                      '${parcel['fromCity']} → ${parcel['toCity']}',
+                      style: TextStyle(fontSize: 12, color: _text2),
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        Icon(Icons.person_outline, size: 12, color: _text2),
+                        const SizedBox(width: 4),
+                        Text(
+                          parcel['senderName'],
+                          style: TextStyle(fontSize: 12, color: _text1),
+                          overflow: TextOverflow.ellipsis,
+                        ),
+                        const SizedBox(width: 12),
+                        Icon(Icons.star, size: 12, color: _orange),
+                        const SizedBox(width: 4),
+                        Text(
+                          '${_formatWeight(parcel['weight'])} kg',
+                          style: TextStyle(fontSize: 12, color: _text2),
+                        ),
+                      ],
+                    ),
+                  ],
+                ),
+              ),
+            ],
+          ),
+          const Divider(height: 20, color: _border),
+          // Two action buttons (no cancel)
+          Row(
+            children: [
+              Expanded(
+                child: ElevatedButton.icon(
+                  icon: Icon(Icons.info_outline, size: 14, color: _indigo),
+                  label: Text(
+                    'Details',
+                    style: TextStyle(fontSize: 11, color: _indigo),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _indigoL.withOpacity(0.1),
+                    foregroundColor: _indigo,
+                    minimumSize: const Size(double.infinity, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                      side: BorderSide(color: _indigoL.withOpacity(0.3)),
+                    ),
+                    elevation: 0,
+                  ),
+                  onPressed: () => _showParcelDetails(parcel),
+                ),
+              ),
+              const SizedBox(width: 8),
+              Expanded(
+                child: ElevatedButton.icon(
+                  icon: const Icon(
+                    Icons.track_changes,
+                    size: 14,
+                    color: Colors.white,
+                  ),
+                  label: const Text(
+                    'Track',
+                    style: TextStyle(fontSize: 11, color: Colors.white),
+                  ),
+                  style: ElevatedButton.styleFrom(
+                    backgroundColor: _indigo,
+                    foregroundColor: Colors.white,
+                    minimumSize: const Size(double.infinity, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    elevation: 0,
+                  ),
+                  onPressed: () {
+                    // Navigate to ParcelTrackingScreen with required data
+                    final drop = parcel['drop'] as Map<String, dynamic>;
+                    final travelerName = parcel['travelerName'] ?? 'Traveler';
+                    Navigator.push(
+                      context,
+                      MaterialPageRoute(
+                        builder: (_) => ParcelTrackingScreen(
+                          parcelId: parcel['id'],
+                          destLat: (drop['lat'] as num?)?.toDouble() ?? 0.0,
+                          destLng: (drop['lng'] as num?)?.toDouble() ?? 0.0,
+                          destLabel: drop['city'] ?? 'Destination',
+                          travelerName: travelerName,
+                        ),
+                      ),
+                    );
+                  },
+                ),
+              ),
+            ],
+          ),
+        ],
+      ),
+    );
   }
 
   // ---------------------------------------------------------------------------
   // BUILD
   // ---------------------------------------------------------------------------
-
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F6FA),
-
+      backgroundColor: _bg,
       appBar: AppBar(
-        title: const Text('Parcel Monitoring'),
-        backgroundColor: const Color(0xFF2D3E91),
+        backgroundColor: _indigo,
         foregroundColor: Colors.white,
-        actions: [
-          IconButton(
-            icon: const Icon(Icons.search),
-            onPressed: () {
-              // TODO: hook up a search delegate
-            },
+        title: const Text(
+          'Parcel Management',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+        ),
+        elevation: 0,
+        actions: const [
+          Padding(
+            padding: EdgeInsets.only(right: 16),
+            child: Icon(Icons.notifications_none, size: 20),
           ),
         ],
       ),
-
       body: StreamBuilder<QuerySnapshot>(
         stream: _parcelsStream(),
         builder: (context, snapshot) {
-
-          // ---- Error ----
           if (snapshot.hasError) {
-            if (kDebugMode) {
-              debugPrint('ParcelManagement error: ${snapshot.error}');
-            }
             return Center(
               child: Column(
                 mainAxisSize: MainAxisSize.min,
                 children: [
-                  const Icon(Icons.error_outline, color: Colors.red, size: 48),
-                  const SizedBox(height: 12),
+                  Icon(Icons.error_outline, color: _red, size: 40),
+                  const SizedBox(height: 8),
                   Text(
                     'Failed to load parcels.\nPlease try again later.',
                     textAlign: TextAlign.center,
-                    style: TextStyle(color: Colors.grey.shade700),
+                    style: TextStyle(color: _text2, fontSize: 14),
                   ),
                 ],
               ),
             );
           }
 
-          // ---- Loading ----
           if (snapshot.connectionState == ConnectionState.waiting) {
             return const Center(child: CircularProgressIndicator());
           }
 
-          // ---- Parse docs safely ----
-          final List<QueryDocumentSnapshot> rawDocs =
-              snapshot.data?.docs ?? [];
+          final allDocs = snapshot.data?.docs ?? [];
+          final List<Map<String, dynamic>> allParcels = allDocs
+              .map(_safeParcel)
+              .toList();
 
-          if (kDebugMode) {
-            debugPrint('ParcelManagement: ${rawDocs.length} docs received');
-          }
+          // Extract unique statuses for filter
+          final statuses = allParcels
+              .map((p) => p['status'] as String)
+              .toSet()
+              .toList();
 
-          // Extract safe maps once — reused for both stats and cards.
-          final List<Map<String, String>> parcels =
-              rawDocs.map(_safeParcel).toList();
-
-          // ---- Live stats (requirement 5) ----
-          final int total     = parcels.length;
-          final int pending   = parcels.where((p) => p['status'] == 'Pending').length;
-          final int inTransit = parcels.where((p) => p['status'] == 'In Transit').length;
-          final int delivered = parcels.where((p) => p['status'] == 'Delivered').length;
+          // Filter by status and search (search by orderId, sender, etc.)
+          final filteredParcels = allParcels.where((p) {
+            final matchesStatus =
+                _selectedStatusFilter == null ||
+                p['status'] == _selectedStatusFilter;
+            final searchLower = _searchText.toLowerCase();
+            final matchesSearch =
+                _searchText.isEmpty ||
+                (p['orderId'] as String).toLowerCase().contains(searchLower) ||
+                (p['senderName'] as String).toLowerCase().contains(
+                  searchLower,
+                ) ||
+                (p['travelerName'] as String).toLowerCase().contains(
+                  searchLower,
+                );
+            return matchesStatus && matchesSearch;
+          }).toList();
 
           return Column(
             children: [
-
-              // ---- STATS BANNER ----
-              Container(
-                color: const Color(0xFF2D3E91),
-                padding: const EdgeInsets.symmetric(
-                    horizontal: 16, vertical: 16),
-                child: LayoutBuilder(
-                  builder: (context, constraints) {
-                    // Divide available width evenly among 4 cards with 3 gaps
-                    final double cardWidth =
-                        (constraints.maxWidth - 24) / 4;
-                    return Row(
-                      mainAxisAlignment: MainAxisAlignment.spaceBetween,
-                      children: [
-                        _statCard(total.toString(),     'Total',      cardWidth),
-                        _statCard(pending.toString(),   'Pending',    cardWidth),
-                        _statCard(inTransit.toString(), 'In Transit', cardWidth),
-                        _statCard(delivered.toString(), 'Delivered',  cardWidth),
-                      ],
-                    );
-                  },
-                ),
-              ),
-
-              const SizedBox(height: 10),
-
-              // ---- SECTION HEADER ----
+              // Search bar
               Padding(
-                padding: const EdgeInsets.symmetric(horizontal: 16),
-                child: Row(
-                  children: [
-                    const Expanded(
-                      child: Text(
-                        'All Parcels',
-                        style: TextStyle(
-                          fontSize: 16,
-                          fontWeight: FontWeight.bold,
-                          color: Color(0xFF2D3E91),
-                        ),
-                      ),
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: TextField(
+                  controller: _searchController,
+                  onChanged: (value) => setState(() => _searchText = value),
+                  decoration: InputDecoration(
+                    hintText: 'Search by order, sender, traveler...',
+                    hintStyle: TextStyle(fontSize: 14, color: _text2),
+                    prefixIcon: Icon(Icons.search, size: 18, color: _indigo),
+                    filled: true,
+                    fillColor: _card,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(30),
+                      borderSide: BorderSide(color: _border),
                     ),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                          horizontal: 12, vertical: 6),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFE8EAF6),
-                        borderRadius: BorderRadius.circular(20),
-                      ),
-                      child: const Row(
-                        children: [
-                          Icon(Icons.filter_list,
-                              size: 16, color: Color(0xFF2D3E91)),
-                          SizedBox(width: 4),
-                          Text(
-                            'Filter',
-                            style: TextStyle(
-                              color: Color(0xFF2D3E91),
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
+                    enabledBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(30),
+                      borderSide: BorderSide(color: _border),
                     ),
-                  ],
-                ),
-              ),
-
-              const SizedBox(height: 10),
-
-              // ---- EMPTY STATE ----
-              if (parcels.isEmpty)
-                const Expanded(
-                  child: Center(child: Text('No parcels found')),
-                )
-
-              // ---- PARCEL LIST ----
-              else
-                Expanded(
-                  child: ListView.builder(
-                    padding: const EdgeInsets.all(16),
-                    itemCount: parcels.length,
-                    itemBuilder: (context, index) {
-                      // Use Firestore doc id as stable key so Flutter diffs
-                      // the list correctly on real-time updates.
-                      return KeyedSubtree(
-                        key: ValueKey(rawDocs[index].id),
-                        child: _parcelCard(context, parcels[index]),
-                      );
-                    },
+                    focusedBorder: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(30),
+                      borderSide: BorderSide(color: _indigo, width: 2),
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 12),
                   ),
                 ),
+              ),
+              // Status filter chips
+              if (statuses.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 6,
+                  ),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
+                      children: [
+                        FilterChip(
+                          label: Text(
+                            'All',
+                            style: TextStyle(fontSize: 12, color: _text1),
+                          ),
+                          selected: _selectedStatusFilter == null,
+                          onSelected: (_) =>
+                              setState(() => _selectedStatusFilter = null),
+                          backgroundColor: _card,
+                          selectedColor: _indigo.withOpacity(0.2),
+                          checkmarkColor: _indigo,
+                          shape: StadiumBorder(
+                            side: BorderSide(color: _border),
+                          ),
+                        ),
+                        const SizedBox(width: 8),
+                        ...statuses.map((status) {
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: FilterChip(
+                              label: Text(
+                                status,
+                                style: TextStyle(fontSize: 12, color: _text1),
+                              ),
+                              selected: _selectedStatusFilter == status,
+                              onSelected: (_) => setState(
+                                () => _selectedStatusFilter = status,
+                              ),
+                              backgroundColor: _card,
+                              selectedColor: _indigo.withOpacity(0.2),
+                              checkmarkColor: _indigo,
+                              shape: StadiumBorder(
+                                side: BorderSide(color: _border),
+                              ),
+                            ),
+                          );
+                        }),
+                      ],
+                    ),
+                  ),
+                ),
+              // Parcel list
+              Expanded(
+                child: filteredParcels.isEmpty
+                    ? Center(
+                        child: Text(
+                          'No parcels found',
+                          style: TextStyle(fontSize: 14, color: _text2),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
+                        ),
+                        itemCount: filteredParcels.length,
+                        itemBuilder: (context, index) {
+                          final parcel = filteredParcels[index];
+                          return KeyedSubtree(
+                            key: ValueKey(parcel['id']),
+                            child: _parcelCard(context, parcel),
+                          );
+                        },
+                      ),
+              ),
             ],
           );
         },
@@ -208,272 +685,9 @@ class ParcelManagementScreen extends StatelessWidget {
     );
   }
 
-  // ---------------------------------------------------------------------------
-  // PARCEL CARD
-  // ---------------------------------------------------------------------------
-
-  Widget _parcelCard(BuildContext context, Map<String, String> parcel) {
-    return Container(
-      margin: const EdgeInsets.only(bottom: 16),
-      padding: const EdgeInsets.all(16),
-      decoration: BoxDecoration(
-        color: Colors.white,
-        borderRadius: BorderRadius.circular(16),
-        boxShadow: const [
-          BoxShadow(
-            blurRadius: 12,
-            color: Color(0x1A2D3E91),
-            offset: Offset(0, 4),
-          ),
-        ],
-      ),
-      child: Column(
-        crossAxisAlignment: CrossAxisAlignment.start,
-        children: [
-
-          // ---- CARD HEADER: parcel ID + status chip ----
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              Row(
-                children: [
-                  Container(
-                    width: 44,
-                    height: 44,
-                    decoration: BoxDecoration(
-                      color: const Color(0xFFE8EAF6),
-                      borderRadius: BorderRadius.circular(12),
-                    ),
-                    child: const Icon(
-                      Icons.inventory_2_outlined,
-                      color: Color(0xFF2D3E91),
-                    ),
-                  ),
-                  const SizedBox(width: 10),
-                  Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        parcel['id']!,
-                        style: const TextStyle(
-                          fontWeight: FontWeight.bold,
-                          fontSize: 15,
-                        ),
-                      ),
-                      const Text(
-                        'Live from Firestore',
-                        style: TextStyle(fontSize: 11, color: Colors.grey),
-                      ),
-                    ],
-                  ),
-                ],
-              ),
-              _statusChip(parcel['status']!),
-            ],
-          ),
-
-          const Divider(height: 20),
-
-          // ---- DETAILS ROW ----
-          Row(
-            mainAxisAlignment: MainAxisAlignment.spaceBetween,
-            children: [
-              _detailColumn('Sender',   parcel['sender']!),
-              _detailColumn('Traveler', parcel['traveler']!),
-              _detailColumn('Weight',   parcel['weight']!),
-            ],
-          ),
-
-          const SizedBox(height: 14),
-
-          // ---- ACTION BUTTONS ----
-          // FIX: Expanded buttons prevent infinite-width constraint crashes
-          Row(
-            children: [
-              Expanded(
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFE8EAF6),
-                    foregroundColor: const Color(0xFF2D3E91),
-                  ),
-                  onPressed: () {
-                    // TODO: Navigate to parcel detail screen
-                  },
-                  child: const Text('View Details'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFF2D3E91),
-                    foregroundColor: Colors.white,
-                  ),
-                  onPressed: () {
-                    // TODO: Navigate to tracking screen
-                  },
-                  child: const Text('Track'),
-                ),
-              ),
-              const SizedBox(width: 8),
-              Expanded(
-                child: ElevatedButton(
-                  style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFFDECEA),
-                    foregroundColor: Colors.red,
-                  ),
-                  onPressed: () => _confirmCancel(context, parcel['id']!),
-                  child: const Text('Cancel'),
-                ),
-              ),
-            ],
-          ),
-        ],
-      ),
-    );
-  }
-
-  // ---------------------------------------------------------------------------
-  // CANCEL CONFIRMATION
-  // ---------------------------------------------------------------------------
-
-  Future<void> _confirmCancel(BuildContext context, String parcelId) async {
-    final confirmed = await showDialog<bool>(
-      context: context,
-      builder: (ctx) => AlertDialog(
-        title: const Text('Cancel Parcel'),
-        content: Text('Cancel parcel "$parcelId"? This cannot be undone.'),
-        actions: [
-          TextButton(
-            onPressed: () => Navigator.pop(ctx, false),
-            child: const Text('Keep'),
-          ),
-          TextButton(
-            style: TextButton.styleFrom(foregroundColor: Colors.red),
-            onPressed: () => Navigator.pop(ctx, true),
-            child: const Text('Cancel Parcel'),
-          ),
-        ],
-      ),
-    );
-
-    if (confirmed != true) return;
-
-    try {
-      // Update status to Cancelled in Firestore; delete if preferred
-      await FirebaseFirestore.instance
-          .collection('parcels')
-          .where('id', isEqualTo: parcelId)
-          .limit(1)
-          .get()
-          .then((snap) {
-        for (final doc in snap.docs) {
-          doc.reference.update({'status': 'Cancelled'});
-        }
-      });
-    } catch (e) {
-      if (!context.mounted) return;
-      ScaffoldMessenger.of(context).showSnackBar(
-        SnackBar(
-          content: Text('Could not cancel parcel: $e'),
-          backgroundColor: Colors.red,
-        ),
-      );
-    }
-  }
-
-  // ---------------------------------------------------------------------------
-  // REUSABLE HELPER WIDGETS
-  // ---------------------------------------------------------------------------
-
-  Widget _statusChip(String status) {
-    // FIX: literal Color values — no .shade accessor that can be null
-    final Color bg;
-    final Color text;
-
-    switch (status) {
-      case 'Delivered':
-        bg   = const Color(0xFFE8F5E9); // green.shade50
-        text = const Color(0xFF4CAF50); // green
-        break;
-      case 'Pending':
-        bg   = const Color(0xFFFFF3E0); // orange.shade50
-        text = const Color(0xFFFF9800); // orange
-        break;
-      case 'Cancelled':
-        bg   = const Color(0xFFFFEBEE); // red.shade50
-        text = const Color(0xFFF44336); // red
-        break;
-      default: // In Transit
-        bg   = const Color(0xFFFFE0B2); // orange.shade100
-        text = const Color(0xFFE64A19); // deepOrange
-    }
-
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 12, vertical: 4),
-      decoration: BoxDecoration(
-        color: bg,
-        borderRadius: BorderRadius.circular(20),
-      ),
-      child: Text(
-        status,
-        style: TextStyle(
-          color: text,
-          fontWeight: FontWeight.bold,
-          fontSize: 12,
-        ),
-      ),
-    );
-  }
-
-  Widget _detailColumn(String label, String value) {
-    return Column(
-      crossAxisAlignment: CrossAxisAlignment.start,
-      children: [
-        Text(
-          label,
-          style: const TextStyle(fontSize: 11, color: Colors.grey),
-        ),
-        const SizedBox(height: 2),
-        Text(
-          value,
-          style: const TextStyle(fontSize: 14, fontWeight: FontWeight.w600),
-        ),
-      ],
-    );
-  }
-
-  Widget _statCard(String number, String label, double width) {
-    return Container(
-      width: width,
-      padding: const EdgeInsets.symmetric(vertical: 10),
-      decoration: BoxDecoration(
-        color: Colors.white24,
-        borderRadius: BorderRadius.circular(12),
-      ),
-      child: Column(
-        mainAxisSize: MainAxisSize.min,
-        mainAxisAlignment: MainAxisAlignment.center,
-        children: [
-          FittedBox(
-            fit: BoxFit.scaleDown,
-            child: Text(
-              number,
-              style: const TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-                color: Colors.white,
-              ),
-            ),
-          ),
-          const SizedBox(height: 2),
-          Text(
-            label,
-            style: const TextStyle(fontSize: 11, color: Colors.white70),
-            overflow: TextOverflow.ellipsis,
-          ),
-        ],
-      ),
-    );
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
   }
 }

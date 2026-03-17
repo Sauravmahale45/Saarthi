@@ -1,5 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:cloud_firestore/cloud_firestore.dart';
+import 'package:intl/intl.dart';
 
 class UserManagementScreen extends StatefulWidget {
   const UserManagementScreen({super.key});
@@ -11,15 +12,16 @@ class UserManagementScreen extends StatefulWidget {
 class _UserManagementScreenState extends State<UserManagementScreen> {
   final TextEditingController _searchController = TextEditingController();
   String _searchText = '';
+  String? _selectedRoleFilter;
 
-  final CollectionReference _users =
-      FirebaseFirestore.instance.collection('users');
+  final CollectionReference _users = FirebaseFirestore.instance.collection(
+    'users',
+  );
 
   // ---------------------------------------------------------------------------
   // FIRESTORE ACTIONS
   // ---------------------------------------------------------------------------
 
-  /// Toggles the blocked state of a user document.
   Future<void> _blockUser(String uid, bool currentStatus) async {
     try {
       await _users.doc(uid).update({'isBlocked': !currentStatus});
@@ -34,7 +36,6 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
     }
   }
 
-  /// Shows a confirmation dialog before permanently deleting a user.
   Future<void> _confirmDelete(String uid, String name) async {
     final confirmed = await showDialog<bool>(
       context: context,
@@ -71,15 +72,10 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
   }
 
   // ---------------------------------------------------------------------------
-  // HELPERS
+  // DATA EXTRACTION
   // ---------------------------------------------------------------------------
 
-  /// Safely reads all fields from a Firestore document.
-  /// Returns guaranteed non-null strings with sensible defaults so the UI
-  /// never crashes when a field is absent.
   Map<String, dynamic> _safeData(QueryDocumentSnapshot doc) {
-    // FIX: doc['field'] throws "Bad state: field does not exist" when the key
-    // is missing.  Cast to Map and use a null-aware lookup with ?? defaults.
     final Map<String, dynamic> raw =
         (doc.data() as Map<String, dynamic>?) ?? {};
 
@@ -96,71 +92,290 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
       'role': raw['role'] is String && (raw['role'] as String).isNotEmpty
           ? raw['role'] as String
           : 'User',
-      // isBlocked can be stored as bool or missing entirely
+      'city': raw['city'] is String && (raw['city'] as String).isNotEmpty
+          ? raw['city'] as String
+          : 'Not specified',
+      'kycVerified': raw['kycVerified'] == true,
+      'rating': raw['rating'] is num ? (raw['rating'] as num).toDouble() : 0.0,
+      'createdAt': raw['createdAt'] is Timestamp ? raw['createdAt'] : null,
+      'photoUrl': raw['photoUrl'] is String ? raw['photoUrl'] as String : null,
       'isBlocked': raw['isBlocked'] == true,
     };
   }
 
-  /// Derives the avatar initials from the display name.
   String _initials(String name) {
     final trimmed = name.trim();
     if (trimmed.isEmpty) return '?';
     return trimmed.substring(0, 1).toUpperCase();
   }
 
+  String _formatDate(Timestamp? timestamp) {
+    if (timestamp == null) return 'N/A';
+    return DateFormat.yMMMd().add_jm().format(timestamp.toDate());
+  }
+
   // ---------------------------------------------------------------------------
-  // USER CARD
+  // PROFILE DRAWER (slides from left)
+  // ---------------------------------------------------------------------------
+
+  void _showUserDrawer(Map<String, dynamic> userData, String uid) {
+    showGeneralDialog(
+      context: context,
+      barrierLabel: "User Profile",
+      barrierDismissible: true,
+      barrierColor: Colors.black.withOpacity(0.5),
+      transitionDuration: const Duration(milliseconds: 300),
+      pageBuilder: (context, anim1, anim2) {
+        // Align the dialog to the left edge of the screen
+        return Align(
+          alignment: Alignment.centerLeft,
+          child: Material(
+            color: Colors.transparent,
+            child: Container(
+              width: MediaQuery.of(context).size.width * 0.8, // drawer width
+              height: double.infinity,
+              decoration: const BoxDecoration(
+                color: Colors.white,
+                borderRadius: BorderRadius.horizontal(
+                  right: Radius.circular(20),
+                ),
+              ),
+              child: SafeArea(
+                child: Column(
+                  crossAxisAlignment: CrossAxisAlignment.start,
+                  children: [
+                    // Header with avatar and name
+                    Container(
+                      padding: const EdgeInsets.fromLTRB(24, 32, 24, 24),
+                      decoration: BoxDecoration(
+                        color: const Color(0xFF00695C).withOpacity(0.1),
+                        borderRadius: const BorderRadius.only(
+                          bottomRight: Radius.circular(30),
+                        ),
+                      ),
+                      child: Row(
+                        children: [
+                          CircleAvatar(
+                            radius: 30,
+                            backgroundImage: userData['photoUrl'] != null
+                                ? NetworkImage(userData['photoUrl'] as String)
+                                : null,
+                            backgroundColor: const Color(0xFFB2DFDB),
+                            child: userData['photoUrl'] == null
+                                ? Text(
+                                    _initials(userData['name']),
+                                    style: const TextStyle(
+                                      fontSize: 20,
+                                      fontWeight: FontWeight.bold,
+                                      color: Color(0xFF00695C),
+                                    ),
+                                  )
+                                : null,
+                          ),
+                          const SizedBox(width: 16),
+                          Expanded(
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.start,
+                              children: [
+                                Text(
+                                  userData['name'],
+                                  style: const TextStyle(
+                                    fontSize: 18,
+                                    fontWeight: FontWeight.bold,
+                                    color: Color(0xFF004D40),
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                                const SizedBox(height: 4),
+                                Text(
+                                  userData['email'],
+                                  style: const TextStyle(
+                                    fontSize: 14,
+                                    color: Colors.black54,
+                                  ),
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ],
+                            ),
+                          ),
+                        ],
+                      ),
+                    ),
+                    const SizedBox(height: 16),
+                    // Details list
+                    Expanded(
+                      child: ListView(
+                        padding: const EdgeInsets.symmetric(horizontal: 24),
+                        children: [
+                          _drawerDetailRow(
+                            Icons.phone,
+                            'Phone',
+                            userData['phone'],
+                          ),
+                          _drawerDetailRow(
+                            Icons.badge,
+                            'Role',
+                            userData['role'],
+                          ),
+                          _drawerDetailRow(
+                            Icons.location_city,
+                            'City',
+                            userData['city'],
+                          ),
+                          _drawerDetailRow(
+                            Icons.verified,
+                            'KYC Verified',
+                            userData['kycVerified'] ? 'Yes' : 'No',
+                            valueColor: userData['kycVerified']
+                                ? Colors.green
+                                : Colors.red,
+                          ),
+                          _drawerDetailRow(
+                            Icons.star,
+                            'Rating',
+                            userData['rating'].toString(),
+                          ),
+                          _drawerDetailRow(
+                            Icons.calendar_today,
+                            'Joined',
+                            _formatDate(userData['createdAt']),
+                          ),
+                          if (userData['isBlocked'] as bool)
+                            const Padding(
+                              padding: EdgeInsets.only(top: 16),
+                              child: Text(
+                                '⛔ Blocked User',
+                                style: TextStyle(
+                                  color: Colors.red,
+                                  fontWeight: FontWeight.bold,
+                                ),
+                              ),
+                            ),
+                        ],
+                      ),
+                    ),
+                    // Close button
+                    Padding(
+                      padding: const EdgeInsets.all(24),
+                      child: Center(
+                        child: TextButton.icon(
+                          onPressed: () => Navigator.pop(context),
+                          icon: const Icon(Icons.close, size: 16),
+                          label: const Text('Close'),
+                          style: TextButton.styleFrom(
+                            foregroundColor: const Color(0xFF00695C),
+                          ),
+                        ),
+                      ),
+                    ),
+                  ],
+                ),
+              ),
+            ),
+          ),
+        );
+      },
+      transitionBuilder: (context, anim1, anim2, child) {
+        return SlideTransition(
+          position: Tween<Offset>(
+            begin: const Offset(-1, 0), // start from left
+            end: Offset.zero,
+          ).animate(CurvedAnimation(parent: anim1, curve: Curves.easeOutCubic)),
+          child: child,
+        );
+      },
+    );
+  }
+
+  Widget _drawerDetailRow(
+    IconData icon,
+    String label,
+    String value, {
+    Color? valueColor,
+  }) {
+    return Padding(
+      padding: const EdgeInsets.symmetric(vertical: 12),
+      child: Row(
+        crossAxisAlignment: CrossAxisAlignment.start,
+        children: [
+          Icon(icon, size: 20, color: const Color(0xFF00695C)),
+          const SizedBox(width: 16),
+          Expanded(
+            child: Column(
+              crossAxisAlignment: CrossAxisAlignment.start,
+              children: [
+                Text(
+                  label,
+                  style: const TextStyle(fontSize: 12, color: Colors.black54),
+                ),
+                const SizedBox(height: 2),
+                Text(
+                  value,
+                  style: TextStyle(
+                    fontSize: 14,
+                    fontWeight: FontWeight.w500,
+                    color: valueColor ?? Colors.black87,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+
+  // ---------------------------------------------------------------------------
+  // USER CARD (modern, full‑width, smaller buttons)
   // ---------------------------------------------------------------------------
 
   Widget _userCard(QueryDocumentSnapshot doc) {
     final String uid = doc.id;
     final Map<String, dynamic> data = _safeData(doc);
 
-    final String name     = data['name']      as String;
-    final String email    = data['email']     as String;
-    final String phone    = data['phone']     as String;
-    final String role     = data['role']      as String;
-    final bool isBlocked  = data['isBlocked'] as bool;
+    final String name = data['name'] as String;
+    final String email = data['email'] as String;
+    final String phone = data['phone'] as String;
+    final String role = data['role'] as String;
+    final bool isBlocked = data['isBlocked'] as bool;
+    final double rating = data['rating'] as double;
 
     return Container(
-      margin: const EdgeInsets.only(bottom: 12),
+      margin: const EdgeInsets.symmetric(vertical: 8), // only vertical spacing
       padding: const EdgeInsets.all(16),
       decoration: BoxDecoration(
         color: Colors.white,
         borderRadius: BorderRadius.circular(16),
-        boxShadow: const [
+        boxShadow: [
           BoxShadow(
             blurRadius: 8,
-            color: Color(0x14000000),
-            offset: Offset(0, 2),
+            color: Colors.black.withOpacity(0.04),
+            offset: const Offset(0, 2),
           ),
         ],
       ),
       child: Column(
         children: [
-          // ---- USER INFO ----
           Row(
             crossAxisAlignment: CrossAxisAlignment.center,
             children: [
               CircleAvatar(
                 radius: 24,
-                backgroundColor: const Color(0xFFE8EAF6),
+                backgroundColor: const Color(0xFFB2DFDB),
                 child: Text(
                   _initials(name),
                   style: const TextStyle(
+                    fontSize: 16,
                     fontWeight: FontWeight.bold,
-                    color: Color(0xFF1A237E),
+                    color: Color(0xFF00695C),
                   ),
                 ),
               ),
-
               const SizedBox(width: 12),
-
               Expanded(
                 child: Column(
                   crossAxisAlignment: CrossAxisAlignment.start,
                   children: [
-                    // Name + role badge row
                     Row(
                       mainAxisAlignment: MainAxisAlignment.spaceBetween,
                       children: [
@@ -168,8 +383,9 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                           child: Text(
                             name,
                             style: const TextStyle(
-                              fontWeight: FontWeight.bold,
-                              fontSize: 15,
+                              fontSize: 16,
+                              fontWeight: FontWeight.w600,
+                              color: Color(0xFF004D40),
                             ),
                             overflow: TextOverflow.ellipsis,
                           ),
@@ -177,12 +393,15 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                         const SizedBox(width: 8),
                         Container(
                           padding: const EdgeInsets.symmetric(
-                              horizontal: 10, vertical: 4),
+                            horizontal: 8,
+                            vertical: 4,
+                          ),
                           decoration: BoxDecoration(
-                            // FIX: literal colors — no .shade accessor
-                            color: role == 'Sender'
-                                ? const Color(0xFFE3F2FD)
-                                : const Color(0xFFE8F5E9),
+                            color: role.toLowerCase() == 'traveler'
+                                ? const Color(0xFFE0F2F1)
+                                : role.toLowerCase() == 'sender'
+                                ? const Color(0xFFE8F5E9)
+                                : const Color(0xFFF3E5F5),
                             borderRadius: BorderRadius.circular(12),
                           ),
                           child: Text(
@@ -190,109 +409,138 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
                             style: TextStyle(
                               fontSize: 11,
                               fontWeight: FontWeight.bold,
-                              color: role == 'Sender'
-                                  ? const Color(0xFF1565C0)
-                                  : const Color(0xFF2E7D32),
+                              color: role.toLowerCase() == 'traveler'
+                                  ? const Color(0xFF00695C)
+                                  : role.toLowerCase() == 'sender'
+                                  ? const Color(0xFF2E7D32)
+                                  : const Color(0xFF7B1FA2),
                             ),
                           ),
                         ),
                       ],
                     ),
-
                     const SizedBox(height: 6),
-
                     Row(
                       children: [
-                        const Icon(Icons.phone, size: 14),
-                        const SizedBox(width: 6),
+                        const Icon(Icons.star, size: 14, color: Colors.amber),
+                        const SizedBox(width: 4),
+                        Text(
+                          rating.toStringAsFixed(1),
+                          style: const TextStyle(
+                            fontSize: 12,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                        const SizedBox(width: 12),
+                        Icon(
+                          Icons.circle,
+                          size: 6,
+                          color: isBlocked ? Colors.red : Colors.green,
+                        ),
+                        const SizedBox(width: 4),
+                        Text(
+                          isBlocked ? 'Blocked' : 'Active',
+                          style: TextStyle(
+                            fontSize: 11,
+                            color: isBlocked ? Colors.red : Colors.green,
+                            fontWeight: FontWeight.w500,
+                          ),
+                        ),
+                      ],
+                    ),
+                    const SizedBox(height: 6),
+                    Row(
+                      children: [
+                        const Icon(Icons.phone, size: 12, color: Colors.grey),
+                        const SizedBox(width: 4),
                         Expanded(
                           child: Text(
                             phone,
+                            style: const TextStyle(fontSize: 12),
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
                       ],
                     ),
-
-                    const SizedBox(height: 4),
-
+                    const SizedBox(height: 2),
                     Row(
                       children: [
-                        const Icon(Icons.email_outlined, size: 14),
-                        const SizedBox(width: 6),
+                        const Icon(
+                          Icons.email_outlined,
+                          size: 12,
+                          color: Colors.grey,
+                        ),
+                        const SizedBox(width: 4),
                         Expanded(
                           child: Text(
                             email,
+                            style: const TextStyle(fontSize: 12),
                             overflow: TextOverflow.ellipsis,
                           ),
                         ),
                       ],
-                    ),
-
-                    const SizedBox(height: 4),
-
-                    Text(
-                      isBlocked ? 'Blocked User' : 'Active',
-                      style: TextStyle(
-                        color: isBlocked ? Colors.red : Colors.green,
-                        fontSize: 12,
-                      ),
                     ),
                   ],
                 ),
               ),
             ],
           ),
-
           const Divider(height: 20),
-
-          // ---- ACTION BUTTONS ----
-          // FIX: buttons wrapped in Expanded so Row never gets infinite-width
-          // constraints (same root cause fixed in TravelerManagementScreen).
+          // Smaller action buttons
           Row(
             children: [
-              // PROFILE
               Expanded(
                 child: ElevatedButton.icon(
-                  icon: const Icon(Icons.person_outline, size: 16),
-                  label: const Text('Profile'),
+                  icon: const Icon(Icons.person_outline, size: 14),
+                  label: const Text('Profile', style: TextStyle(fontSize: 11)),
                   style: ElevatedButton.styleFrom(
-                    backgroundColor: const Color(0xFFE8EAF6),
-                    foregroundColor: const Color(0xFF1A237E),
+                    backgroundColor: const Color(0xFFE0F2F1),
+                    foregroundColor: const Color(0xFF00695C),
+                    minimumSize: const Size(double.infinity, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    elevation: 0,
                   ),
-                  onPressed: () {
-                    // TODO: Navigate to user profile screen
-                  },
+                  onPressed: () => _showUserDrawer(data, uid),
                 ),
               ),
-
-              const SizedBox(width: 8),
-
-              // BLOCK / UNBLOCK
+              const SizedBox(width: 6),
               Expanded(
                 child: ElevatedButton.icon(
-                  icon: const Icon(Icons.block, size: 16),
-                  label: Text(isBlocked ? 'Unblock' : 'Block'),
+                  icon: const Icon(Icons.block, size: 14),
+                  label: Text(
+                    isBlocked ? 'Unblock' : 'Block',
+                    style: const TextStyle(fontSize: 11),
+                  ),
                   style: ElevatedButton.styleFrom(
-                    // FIX: literal colors — Colors.orange.shade100/800
-                    // can be null and crash styleFrom
-                    backgroundColor: const Color(0xFFFFE0B2), // orange.shade100
-                    foregroundColor: const Color(0xFFE65100), // orange.shade800
+                    backgroundColor: const Color(0xFFFFF3E0),
+                    foregroundColor: const Color(0xFFE65100),
+                    minimumSize: const Size(double.infinity, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    elevation: 0,
                   ),
                   onPressed: () => _blockUser(uid, isBlocked),
                 ),
               ),
-
-              const SizedBox(width: 8),
-
-              // DELETE
+              const SizedBox(width: 6),
               Expanded(
                 child: ElevatedButton.icon(
-                  icon: const Icon(Icons.delete_outline, size: 16),
-                  label: const Text('Delete'),
+                  icon: const Icon(Icons.delete_outline, size: 14),
+                  label: const Text('Delete', style: TextStyle(fontSize: 11)),
                   style: ElevatedButton.styleFrom(
                     backgroundColor: const Color(0xFFFFEBEE),
                     foregroundColor: const Color(0xFFC62828),
+                    minimumSize: const Size(double.infinity, 32),
+                    padding: const EdgeInsets.symmetric(horizontal: 8),
+                    shape: RoundedRectangleBorder(
+                      borderRadius: BorderRadius.circular(8),
+                    ),
+                    elevation: 0,
                   ),
                   onPressed: () => _confirmDelete(uid, name),
                 ),
@@ -311,115 +559,186 @@ class _UserManagementScreenState extends State<UserManagementScreen> {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFFF5F6FA),
-
+      backgroundColor: const Color(0xFFF5F5F5),
       appBar: AppBar(
-        backgroundColor: const Color(0xFF1A237E),
+        backgroundColor: const Color(0xFF00695C),
         foregroundColor: Colors.white,
-        title: const Text('User Management'),
+        title: const Text(
+          'User Management',
+          style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+        ),
+        elevation: 0,
         actions: const [
           Padding(
             padding: EdgeInsets.only(right: 16),
-            child: Icon(Icons.notifications_none),
+            child: Icon(Icons.notifications_none, size: 20),
           ),
         ],
       ),
+      body: StreamBuilder<QuerySnapshot>(
+        stream: _users.snapshots(),
+        builder: (context, snapshot) {
+          if (snapshot.hasError) {
+            return Center(
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(Icons.error_outline, color: Colors.red, size: 40),
+                  const SizedBox(height: 8),
+                  Text(
+                    'Failed to load users.\nPlease try again later.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(color: Colors.grey.shade700, fontSize: 14),
+                  ),
+                ],
+              ),
+            );
+          }
 
-      body: Column(
-        children: [
-          // ---- SEARCH BAR ----
-          Padding(
-            padding: const EdgeInsets.all(16),
-            child: TextField(
-              controller: _searchController,
-              onChanged: (value) {
-                setState(() {
-                  _searchText = value.toLowerCase().trim();
-                });
-              },
-              decoration: InputDecoration(
-                hintText: 'Search users...',
-                prefixIcon: const Icon(Icons.search),
-                filled: true,
-                fillColor: Colors.white,
-                border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(12),
+          if (!snapshot.hasData ||
+              snapshot.connectionState == ConnectionState.waiting) {
+            return const Center(child: CircularProgressIndicator());
+          }
+
+          final allDocs = snapshot.data!.docs;
+          final List<Map<String, dynamic>> allUsers = allDocs.map((doc) {
+            return {..._safeData(doc), 'uid': doc.id};
+          }).toList();
+
+          final Set<String> roles = allUsers
+              .map((u) => u['role'] as String)
+              .where((r) => r.isNotEmpty)
+              .toSet();
+
+          final filteredUsers = allUsers.where((user) {
+            final name = (user['name'] as String).toLowerCase();
+            final phone = (user['phone'] as String).toLowerCase();
+            final email = (user['email'] as String).toLowerCase();
+            final role = user['role'] as String;
+
+            final matchesSearch =
+                _searchText.isEmpty ||
+                name.contains(_searchText) ||
+                phone.contains(_searchText) ||
+                email.contains(_searchText);
+
+            final matchesRole =
+                _selectedRoleFilter == null || role == _selectedRoleFilter;
+
+            return matchesSearch && matchesRole;
+          }).toList();
+
+          return Column(
+            children: [
+              Padding(
+                padding: const EdgeInsets.fromLTRB(16, 12, 16, 8),
+                child: TextField(
+                  controller: _searchController,
+                  onChanged: (value) =>
+                      setState(() => _searchText = value.toLowerCase().trim()),
+                  decoration: InputDecoration(
+                    hintText: 'Search by name, email, phone...',
+                    hintStyle: const TextStyle(fontSize: 14),
+                    prefixIcon: const Icon(Icons.search, size: 18),
+                    filled: true,
+                    fillColor: Colors.white,
+                    border: OutlineInputBorder(
+                      borderRadius: BorderRadius.circular(30),
+                      borderSide: BorderSide.none,
+                    ),
+                    contentPadding: const EdgeInsets.symmetric(vertical: 12),
+                  ),
                 ),
               ),
-            ),
-          ),
-
-          // ---- LIVE USER LIST ----
-          Expanded(
-            child: StreamBuilder<QuerySnapshot>(
-              stream: _users.snapshots(),
-              builder: (context, snapshot) {
-                // Error state
-                if (snapshot.hasError) {
-                  return Center(
-                    child: Column(
-                      mainAxisSize: MainAxisSize.min,
+              if (roles.isNotEmpty)
+                Padding(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 16,
+                    vertical: 6,
+                  ),
+                  child: SingleChildScrollView(
+                    scrollDirection: Axis.horizontal,
+                    child: Row(
                       children: [
-                        const Icon(Icons.error_outline,
-                            color: Colors.red, size: 48),
-                        const SizedBox(height: 12),
-                        Text(
-                          'Failed to load users.\nPlease try again later.',
-                          textAlign: TextAlign.center,
-                          style: TextStyle(color: Colors.grey.shade700),
+                        FilterChip(
+                          label: const Text(
+                            'All',
+                            style: TextStyle(fontSize: 12),
+                          ),
+                          selected: _selectedRoleFilter == null,
+                          onSelected: (_) =>
+                              setState(() => _selectedRoleFilter = null),
+                          backgroundColor: Colors.white,
+                          selectedColor: const Color(
+                            0xFF00695C,
+                          ).withOpacity(0.2),
+                          checkmarkColor: const Color(0xFF00695C),
+                          labelStyle: TextStyle(
+                            fontSize: 12,
+                            color: _selectedRoleFilter == null
+                                ? const Color(0xFF00695C)
+                                : Colors.black,
+                          ),
                         ),
+                        const SizedBox(width: 8),
+                        ...roles.map((role) {
+                          return Padding(
+                            padding: const EdgeInsets.only(right: 8),
+                            child: FilterChip(
+                              label: Text(
+                                role,
+                                style: const TextStyle(fontSize: 12),
+                              ),
+                              selected: _selectedRoleFilter == role,
+                              onSelected: (_) =>
+                                  setState(() => _selectedRoleFilter = role),
+                              backgroundColor: Colors.white,
+                              selectedColor: const Color(
+                                0xFF00695C,
+                              ).withOpacity(0.2),
+                              checkmarkColor: const Color(0xFF00695C),
+                              labelStyle: TextStyle(
+                                fontSize: 12,
+                                color: _selectedRoleFilter == role
+                                    ? const Color(0xFF00695C)
+                                    : Colors.black,
+                              ),
+                            ),
+                          );
+                        }),
                       ],
                     ),
-                  );
-                }
-
-                // Loading state
-                if (!snapshot.hasData ||
-                    snapshot.connectionState == ConnectionState.waiting) {
-                  return const Center(child: CircularProgressIndicator());
-                }
-
-                // FIX: Filter is applied after safe data extraction so missing
-                // phone/name fields never throw — they resolve to 'N/A' /
-                // 'Unknown User' before the .contains() call.
-                final List<QueryDocumentSnapshot> docs =
-                    snapshot.data!.docs.where((doc) {
-                  final Map<String, dynamic> d = _safeData(doc);
-                  final String name =
-                      (d['name'] as String).toLowerCase();
-                  final String phone =
-                      (d['phone'] as String).toLowerCase();
-                  // FIX: also search by email and role for a richer filter
-                  final String email =
-                      (d['email'] as String).toLowerCase();
-
-                  if (_searchText.isEmpty) return true;
-                  return name.contains(_searchText) ||
-                      phone.contains(_searchText) ||
-                      email.contains(_searchText);
-                }).toList();
-
-                // Empty state
-                if (docs.isEmpty) {
-                  return const Center(
-                    child: Text('No users found'),
-                  );
-                }
-
-                return ListView.builder(
-                  padding: const EdgeInsets.all(16),
-                  itemCount: docs.length,
-                  itemBuilder: (context, index) {
-                    return KeyedSubtree(
-                      key: ValueKey(docs[index].id),
-                      child: _userCard(docs[index]),
-                    );
-                  },
-                );
-              },
-            ),
-          ),
-        ],
+                  ),
+                ),
+              Expanded(
+                child: filteredUsers.isEmpty
+                    ? const Center(
+                        child: Text(
+                          'No users found',
+                          style: TextStyle(fontSize: 14),
+                        ),
+                      )
+                    : ListView.builder(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
+                        ),
+                        itemCount: filteredUsers.length,
+                        itemBuilder: (context, index) {
+                          final user = filteredUsers[index];
+                          final originalDoc = allDocs.firstWhere(
+                            (doc) => doc.id == user['uid'],
+                          );
+                          return KeyedSubtree(
+                            key: ValueKey(user['uid']),
+                            child: _userCard(originalDoc),
+                          );
+                        },
+                      ),
+              ),
+            ],
+          );
+        },
       ),
     );
   }

@@ -51,19 +51,19 @@ class AdminDashboard extends StatelessWidget {
       .snapshots()
       .map((s) => s.docs.length);
 
-  Stream<double> _revenueStream() =>
-      FirebaseFirestore.instance.collection('payments').snapshots().map(
-        (snapshot) {
-          double total = 0.0;
-          for (final doc in snapshot.docs) {
-            final data = doc.data();
-            if (data is! Map<String, dynamic>) continue;
-            final raw = data['amount'];
-            if (raw is num) total += raw.toDouble();
-          }
-          return total;
-        },
-      );
+  Stream<double> _revenueStream() => FirebaseFirestore.instance
+      .collection('payments')
+      .snapshots()
+      .map((snapshot) {
+        double total = 0.0;
+        for (final doc in snapshot.docs) {
+          final data = doc.data();
+          if (data is! Map<String, dynamic>) continue;
+          final raw = data['amount'];
+          if (raw is num) total += raw.toDouble();
+        }
+        return total;
+      });
 
   // ---------------------------------------------------------------------------
   // STAT CARD
@@ -118,10 +118,7 @@ class AdminDashboard extends StatelessWidget {
             alignment: Alignment.centerLeft,
             child: Text(
               number,
-              style: const TextStyle(
-                fontSize: 20,
-                fontWeight: FontWeight.bold,
-              ),
+              style: const TextStyle(fontSize: 20, fontWeight: FontWeight.bold),
             ),
           ),
 
@@ -152,8 +149,9 @@ class AdminDashboard extends StatelessWidget {
     return StreamBuilder<int>(
       stream: stream,
       builder: (context, snapshot) {
-        final value =
-            snapshot.hasError ? "—" : snapshot.data?.toString() ?? "...";
+        final value = snapshot.hasError
+            ? "—"
+            : snapshot.data?.toString() ?? "...";
         return _statCard(icon, iconColor, bgColor, value, label);
       },
     );
@@ -176,10 +174,8 @@ class AdminDashboard extends StatelessWidget {
   ) {
     return InkWell(
       borderRadius: BorderRadius.circular(20),
-      onTap: () => Navigator.push(
-        context,
-        MaterialPageRoute(builder: (_) => page),
-      ),
+      onTap: () =>
+          Navigator.push(context, MaterialPageRoute(builder: (_) => page)),
       child: Container(
         padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 14),
         decoration: BoxDecoration(
@@ -332,10 +328,7 @@ class AdminDashboard extends StatelessWidget {
 
                 const Text(
                   "Overview",
-                  style: TextStyle(
-                    fontSize: 22,
-                    fontWeight: FontWeight.bold,
-                  ),
+                  style: TextStyle(fontSize: 22, fontWeight: FontWeight.bold),
                 ),
 
                 const SizedBox(height: 20),
@@ -378,8 +371,8 @@ class AdminDashboard extends StatelessWidget {
                         final display = snapshot.hasError
                             ? "—"
                             : snapshot.data != null
-                                ? "₹${snapshot.data!.toStringAsFixed(0)}"
-                                : "...";
+                            ? "₹${snapshot.data!.toStringAsFixed(0)}"
+                            : "...";
                         return _statCard(
                           Icons.currency_rupee,
                           Colors.green,
@@ -396,10 +389,7 @@ class AdminDashboard extends StatelessWidget {
 
                 const Text(
                   "Admin Modules",
-                  style: TextStyle(
-                    fontSize: 18,
-                    fontWeight: FontWeight.bold,
-                  ),
+                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
                 ),
 
                 const SizedBox(height: 16),
