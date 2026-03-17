@@ -10,7 +10,8 @@ import 'package:go_router/go_router.dart';
 // CONFIG — swap these before release
 // ─────────────────────────────────────────────────────────────────────────────
 const _kRazorpayKeyId = 'rzp_live_R9zV5xSLAabRtZ'; // ← replace
-const _kBackendBaseUrl = 'http://192.168.0.102:5000/api/payment'; // ← replace
+const _kBackendBaseUrl =
+    'https://payment-server-oi6b.onrender.com/api/payment'; // ← replace
 
 // ─────────────────────────────────────────────────────────────────────────────
 // PROFESSIONAL PALETTE (dark, clean, blue‑accented)

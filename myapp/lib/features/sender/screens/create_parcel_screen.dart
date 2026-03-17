@@ -10,7 +10,7 @@ import 'package:go_router/go_router.dart';
 import 'package:http/http.dart' as http;
 import 'package:intl/intl.dart';
 import 'package:flutter_typeahead/flutter_typeahead.dart'; // <-- Added
-
+import 'dart:math' as math;
 // ---------- Color Palette ----------
 const primaryColor = Color(0xFF4F46E5);
 const secondaryColor = Color(0xFF14B8A6);
@@ -76,6 +76,7 @@ class MainCategory {
   final IconData icon;
   final List<SubCategory> subCategories;
   final List<ParcelSize> sizes;
+  final double pricePerKm; // ✅ added
 
   const MainCategory({
     required this.label,
@@ -84,6 +85,8 @@ class MainCategory {
     required this.icon,
     required this.subCategories,
     required this.sizes,
+        required this.pricePerKm, // ✅ added
+
   });
 }
 
@@ -94,6 +97,7 @@ final mainCategories = [
     emoji: '📄',
     color: primaryColor,
     icon: Icons.description_outlined,
+        pricePerKm: 2, 
     subCategories: const [
       SubCategory(label: 'Legal Papers', emoji: '⚖️'),
       SubCategory(label: 'Certificate', emoji: '🏅'),
@@ -113,6 +117,7 @@ final mainCategories = [
     emoji: '🍱',
     color: accentColor,
     icon: Icons.fastfood_outlined,
+      pricePerKm: 3, // ₹6/km
     subCategories: const [
       SubCategory(label: 'Seasonal Items', emoji: '🌾'),
       SubCategory(label: 'Home-cooked Meal', emoji: '🍲'),
@@ -132,6 +137,7 @@ final mainCategories = [
     emoji: '📱',
     color: secondaryColor,
     icon: Icons.devices_outlined,
+      pricePerKm: 8, // ₹8/km
     subCategories: const [
       SubCategory(label: 'Mobile / Tablet', emoji: '📱'),
       SubCategory(label: 'Laptop', emoji: '💻'),
@@ -151,6 +157,7 @@ final mainCategories = [
     emoji: '👕',
     color: Color(0xFF10B981),
     icon: Icons.checkroom_outlined,
+      pricePerKm: 2, // ₹2/km
     subCategories: const [
       SubCategory(label: 'Casual Wear', emoji: '👕'),
       SubCategory(label: 'Ethnic / Saree', emoji: '🥻'),
@@ -170,6 +177,7 @@ final mainCategories = [
     emoji: '📦',
     color: Color(0xFF8B5CF6),
     icon: Icons.category_outlined,
+      pricePerKm: 5, // ₹5/km
     subCategories: const [
       SubCategory(label: 'Gift', emoji: '🎁'),
       SubCategory(label: 'Medicines', emoji: '💊'),
@@ -280,7 +288,19 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
     with SingleTickerProviderStateMixin {
   static const _cloudName = 'dwjzuw8fd';
   static const _uploadPreset = 'parcel_upload';
+double _calculateTotalPrice() {
+  if (_distanceKm == null ||
+      _selectedCategory == null ||
+      _selectedSize == null) {
+    return 0;
+  }
 
+  double basePrice = _selectedSize!.price;
+  double distanceCharge =
+      _distanceKm! * _selectedCategory!.pricePerKm;
+
+  return basePrice + distanceCharge;
+}
   // Form keys & controllers
   final _formKey = GlobalKey<FormState>();
   final _receiverCtrl = TextEditingController();
@@ -371,6 +391,32 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
   // ---------- Location Helpers ----------
   List<String> _getAreasForCity(String city) => cityAreas[city] ?? [];
 
+double _calculateDistance(
+  double lat1,
+  double lon1,
+  double lat2,
+  double lon2,
+) {
+  const earthRadius = 6371;
+
+  final dLat = _degToRad(lat2 - lat1);
+  final dLon = _degToRad(lon2 - lon1);
+
+  final a =
+      (math.sin(dLat / 2) * math.sin(dLat / 2)) +
+      math.cos(_degToRad(lat1)) *
+          math.cos(_degToRad(lat2)) *
+          (math.sin(dLon / 2) * math.sin(dLon / 2));
+
+  final c = 2 * math.atan2(math.sqrt(a), math.sqrt(1 - a));
+
+  return earthRadius * c;
+}
+
+double _degToRad(double deg) {
+  return deg * (math.pi / 180);
+}
+
   void _updatePickupLocation(String address, double? lat, double? lng) {
     setState(() {
       _pickup.address = address;
@@ -389,22 +435,75 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
     _calculateRoute();
   }
 
-  // Dummy route calculation (replace with actual routing API)
-  void _calculateRoute() {
-    if (_pickup.latitude != null && _drop.latitude != null) {
-      // Simulated distance: 12.5km, ETA 25min
-      setState(() {
-        _distanceKm = 12.5;
-        _etaMinutes = 25;
-      });
-    } else {
-      setState(() {
-        _distanceKm = null;
-        _etaMinutes = null;
-      });
-    }
-  }
+//   void _calculateRoute() {
+//   if (_pickup.latitude != null &&
+//       _pickup.longitude != null &&
+//       _drop.latitude != null &&
+//       _drop.longitude != null) {
 
+//     final distance = _calculateDistance(
+//       _pickup.latitude!,
+//       _pickup.longitude!,
+//       _drop.latitude!,
+//       _drop.longitude!,
+//     );
+
+//     // Assume average travel speed 40 km/h for preview
+//     final eta = ((distance / 40) * 60).ceil();
+
+//     setState(() {
+//       _distanceKm = distance;
+//       _etaMinutes = eta;
+//     });
+//   } else {
+//     setState(() {
+//       _distanceKm = null;
+//       _etaMinutes = null;
+//     });
+//   }
+// }
+Future<void> _calculateRoute() async {
+  if (_pickup.latitude != null &&
+      _pickup.longitude != null &&
+      _drop.latitude != null &&
+      _drop.longitude != null) {
+
+    try {
+      final url = Uri.parse(
+        "https://router.project-osrm.org/route/v1/driving/"
+        "${_pickup.longitude},${_pickup.latitude};"
+        "${_drop.longitude},${_drop.latitude}"
+        "?overview=false",
+      );
+
+      final response = await http.get(url);
+
+      if (response.statusCode == 200) {
+        final data = jsonDecode(response.body);
+
+        final route = data["routes"][0];
+
+        final distanceMeters = route["distance"];
+        final durationSeconds = route["duration"];
+
+        final distanceKm = distanceMeters / 1000;
+        final etaMinutes = (durationSeconds / 60).ceil();
+
+        setState(() {
+          _distanceKm = distanceKm;
+          _etaMinutes = etaMinutes;
+        });
+      }
+    } catch (e) {
+      debugPrint("Route error: $e");
+    }
+  } else {
+    setState(() {
+      _distanceKm = null;
+      _etaMinutes = null;
+    });
+  }
+}
   // ---------- Image picker ----------
   Future<void> _pickImage(ImageSource source) async {
     final picked = await ImagePicker().pickImage(
@@ -549,9 +648,9 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
     if (_drop.city.isEmpty || _drop.area.isEmpty || _drop.address.isEmpty) {
       return _showSnack('Please complete drop location', isError: true);
     }
-    if (_pickup.city == _drop.city && _pickup.area == _drop.area) {
+    if (_pickup.address == _drop.address ) {
       return _showSnack(
-        'Pickup and drop cannot be the same area',
+        'Pickup and drop cannot be the same address',
         isError: true,
       );
     }
@@ -601,7 +700,7 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
         'receiverName': _receiverCtrl.text.trim(),
         'receiverPhone': _receiverPhone.text.trim(),
         'photoUrl': photoUrl,
-        'price': _selectedSize!.price,
+        'price': _calculateTotalPrice(),
 
         // Status and timestamps
         'status': 'pending',
@@ -1372,6 +1471,7 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
   }
 
   Widget _buildPriceSummary() {
+    
     final cat = _selectedCategory!;
     final sub = _selectedSub!;
     final size = _selectedSize!;
@@ -1412,6 +1512,21 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
           _PriceRow(label: 'Sub-category', value: '${sub.emoji}  ${sub.label}'),
           _PriceRow(label: 'Size', value: size.label),
           _PriceRow(label: 'Weight', value: '${size.weightKg} kg'),
+          _PriceRow(
+  label: 'Distance',
+  value: '${_distanceKm?.toStringAsFixed(1) ?? 0} km',
+),
+
+_PriceRow(
+  label: 'Per KM Charge',
+  value: '₹${_selectedCategory!.pricePerKm}/km',
+),
+
+_PriceRow(
+  label: 'Distance Cost',
+  value:
+      '₹${((_distanceKm ?? 0) * _selectedCategory!.pricePerKm).toStringAsFixed(0)}',
+),
           const Padding(
             padding: EdgeInsets.symmetric(vertical: 10),
             child: Divider(color: Colors.white24, height: 1),
@@ -1437,7 +1552,7 @@ class _CreateParcelScreenState extends State<CreateParcelScreen>
                   borderRadius: BorderRadius.circular(10),
                 ),
                 child: Text(
-                  '₹${size.price.toStringAsFixed(0)}',
+                  '₹${_calculateTotalPrice().toStringAsFixed(0)}',
                   style: const TextStyle(
                     fontSize: 18,
                     fontWeight: FontWeight.bold,
@@ -1794,7 +1909,20 @@ class _RoutePreviewCard extends StatelessWidget {
   final double? distance;
   final int? eta;
   const _RoutePreviewCard({this.distance, this.eta});
+ String _formatEta(int minutes) {
+    if (minutes < 60) {
+      return "$minutes min";
+    }
 
+    final hours = minutes ~/ 60;
+    final mins = minutes % 60;
+
+    if (mins == 0) {
+      return "$hours hr";
+    }
+
+    return "$hours hr $mins min";
+  }
   @override
   Widget build(BuildContext context) {
     return Container(
@@ -1828,7 +1956,7 @@ class _RoutePreviewCard extends StatelessWidget {
                 ),
                 const SizedBox(height: 4),
                 Text(
-                  'Distance: ${distance?.toStringAsFixed(1) ?? '--'} km  •  ETA: ${eta ?? '--'} min',
+                  'Distance: ${distance?.toStringAsFixed(1) ?? '--'} Km  ETA: ${eta != null ? _formatEta(eta!) : '--'}',
                   style: const TextStyle(fontSize: 13, color: textPrimary),
                 ),
               ],

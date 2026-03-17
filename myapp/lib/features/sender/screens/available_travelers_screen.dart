@@ -1,10 +1,12 @@
 // ════════════════════════════════════════════════════════════════════════════
-//  available_travelers_screen.dart  –  Saarthi (UPDATED v5)
+//  available_travelers_screen.dart  –  Saarthi (UPDATED v6)
 //
-//  NEW IN v5:
-//   • Area matching (pickup.area == fromArea, drop.area == toArea)
-//   • Rating fetched from users collection, displayed on traveler cards
-//   • Travelers sorted by rating descending (highest first)
+//  CHANGES IN v6:
+//   • Integrated FcmSender.notifyParcelRequest() inside _requestTraveler()
+//     so the traveler receives a push notification the moment a sender
+//     picks them and hits "Request This Traveler".
+//   • Import added: package:myapp/notifications/notifications.dart
+//   • All other logic/UI is identical to v5.
 // ════════════════════════════════════════════════════════════════════════════
 
 import 'dart:async';
@@ -13,6 +15,11 @@ import 'package:cloud_firestore/cloud_firestore.dart';
 import 'package:firebase_auth/firebase_auth.dart';
 import 'package:flutter/material.dart';
 import 'package:go_router/go_router.dart';
+
+// ── Notification module ───────────────────────────────────────────────────────
+// FcmSender.notifyParcelRequest() pings the traveler's device after the
+// sender commits the 'requested' status to Firestore.
+import 'package:myapp/notifications/notifications.dart';
 
 // ── Brand colours ─────────────────────────────────────────────────────────────
 const _indigo = Color(0xFF4F46E5);
@@ -52,7 +59,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
   // ── Real-time parcel stream ───────────────────────────────────────────────
   Stream<DocumentSnapshot>? _parcelStream;
 
-  // ── 15-minute expiry timer (sender side) ──────────────────────────────────
+  // ── 15-minute expiry timer (sender side) ─────────────────────────────────
   Timer? _expiryTimer;
   Timer? _countdownTicker;
   Duration _timeRemaining = Duration.zero;
@@ -282,7 +289,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  REQUEST A TRAVELER
+  //  REQUEST A TRAVELER  ← notification wired in here
   // ══════════════════════════════════════════════════════════════════════════
   Future<void> _requestTraveler(String travelerId, String travelerName) async {
     if (travelerId.isEmpty) return;
@@ -294,6 +301,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           .collection('parcels')
           .doc(widget.parcelId);
 
+      // ── 1. Read-before-write guard ──────────────────────────────────────
       final freshSnap = await parcelRef.get();
       if (!freshSnap.exists) {
         _toast('Parcel no longer exists.', isError: true);
@@ -310,6 +318,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
         return;
       }
 
+      // ── 2. Commit the request to Firestore ──────────────────────────────
       await parcelRef.update({
         'travelerId': travelerId,
         'travelerName': travelerName,
@@ -317,6 +326,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
         'requestedAt': FieldValue.serverTimestamp(),
       });
 
+      // ── 3. Update local UI state immediately ────────────────────────────
       setState(() {
         _assignedTravelerId = travelerId;
         _requestingTravelerId = null;
@@ -325,6 +335,31 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
       });
 
       _toast('✅ Request sent! Traveler has 15 minutes to respond.');
+
+      // ── 4. Push notification → traveler's device ────────────────────────
+      //
+      // We read the extra fields required for a rich notification body
+      // directly from the parcel snapshot we already fetched above.
+      //
+      // Fire-and-forget (no await) so the UI stays responsive even if
+      // the Cloud Function takes a moment to respond.
+      final senderName =
+          FirebaseAuth.instance.currentUser?.displayName ?? 'A sender';
+      final fromCity = freshData['fromCity'] as String? ?? '';
+      final toCity = freshData['toCity'] as String? ?? '';
+      final category = freshData['category'] as String? ?? 'Parcel';
+      final price = (freshData['price'] as num?) ?? 0;
+
+      NotificationService.notifyParcelRequest(
+        toUid: travelerId, // traveler receives the push
+        parcelId: widget.parcelId,
+        fromCity: fromCity,
+        toCity: toCity,
+        category: category,
+        price: price,
+        senderName: senderName,
+      );
+      // ────────────────────────────────────────────────────────────────────
     } catch (e) {
       setState(() => _requestingTravelerId = null);
       _toast('Failed to send request: $e', isError: true);
@@ -399,7 +434,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
   }
 
   // ══════════════════════════════════════════════════════════════════════════
-  //  CONTENT (main UI)
+  //  CONTENT (main UI — unchanged from v5)
   // ══════════════════════════════════════════════════════════════════════════
   Widget _buildContent() {
     final p = _parcel!;
@@ -573,7 +608,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           ),
         ),
 
-        // ── ⏱ COUNTDOWN BANNER (only when status == 'requested') ────────────
+        // ── ⏱ COUNTDOWN BANNER ──────────────────────────────────────────────
         if (parcelStatus == 'requested' && _timeRemaining.inSeconds > 0)
           SliverToBoxAdapter(
             child: Padding(
@@ -629,7 +664,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
           ),
         ),
 
-        // ── Traveler list with rating loading and sorting ────────────────────
+        // ── Traveler list ────────────────────────────────────────────────────
         SliverPadding(
           padding: const EdgeInsets.fromLTRB(16, 0, 16, 32),
           sliver: travelersStream == null
@@ -664,7 +699,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                       );
                     }
 
-                    // Apply area/space/deadline filters
                     final filtered = _filterRoutes(allDocs, weight);
                     if (filtered.isEmpty) {
                       return const SliverToBoxAdapter(
@@ -672,7 +706,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                       );
                     }
 
-                    // Load ratings and sort (async)
                     if (_filteredTravelersWithRating == null &&
                         !_loadingRatings) {
                       WidgetsBinding.instance.addPostFrameCallback((_) {
@@ -680,7 +713,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                       });
                     }
 
-                    // Show loading while ratings are being fetched
                     if (_loadingRatings ||
                         _filteredTravelersWithRating == null) {
                       return const SliverToBoxAdapter(
@@ -693,7 +725,6 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                       );
                     }
 
-                    // Build list from enriched data
                     return SliverList(
                       delegate: SliverChildBuilderDelegate((ctx, i) {
                         final data = _filteredTravelersWithRating![i];
@@ -708,7 +739,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
                             parcelStatus == 'accepted' && !isAssigned;
 
                         return _TravelerCard(
-                          routeData: data, // now contains 'rating'
+                          routeData: data,
                           isAssigned: isAssigned,
                           isAccepted: isAccepted,
                           isRequested: isRequested,
@@ -730,7 +761,7 @@ class _AvailableTravelersScreenState extends State<AvailableTravelersScreen> {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  COUNTDOWN BANNER
+//  COUNTDOWN BANNER (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 class _CountdownBanner extends StatelessWidget {
   final Duration remaining;
@@ -982,7 +1013,7 @@ class _ParcelSummaryCard extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  TRAVELER CARD (now with rating display)
+//  TRAVELER CARD (unchanged from v5)
 // ════════════════════════════════════════════════════════════════════════════
 class _TravelerCard extends StatelessWidget {
   final Map<String, dynamic> routeData;
@@ -1614,7 +1645,7 @@ class _Divider extends StatelessWidget {
 }
 
 // ════════════════════════════════════════════════════════════════════════════
-//  EXTENSION: safe map access
+//  EXTENSION: safe map access (unchanged)
 // ════════════════════════════════════════════════════════════════════════════
 extension MapGet on Map<String, dynamic> {
   T? tryGet<T>(String key, T fallback) {
